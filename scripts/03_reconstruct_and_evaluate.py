@@ -38,7 +38,8 @@ def main() -> None:
             ["uniform_random", "variable_density", "equispaced_lines"], cfg, train, rng
         )
 
-    frame = experiment.evaluate_masks(mask_dict, test, cfg, run, prefix="recon")
+    spectrum = experiment.mean_power_spectrum(train)
+    frame = experiment.evaluate_masks(mask_dict, test, cfg, run, prefix="recon", spectrum=spectrum)
 
     summary = frame.groupby(["mask", "method"])[["psnr", "ssim", "nrmse"]].mean()
     print(summary.round(4).to_string())

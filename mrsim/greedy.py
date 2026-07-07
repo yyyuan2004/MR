@@ -1,4 +1,4 @@
-"""Greedy k-space sample selection strategies (NumPy)."""
+"""Greedy frequency-domain measurement selection strategies (NumPy)."""
 
 from __future__ import annotations
 
@@ -31,7 +31,7 @@ def greedy_a_optimal(
     noise_var: float = 1e-3,
     n_center: int = 0,
 ) -> np.ndarray:
-    """Greedy Bayesian A-optimal selection with a diagonal k-space prior."""
+    """Greedy Bayesian A-optimal selection with a diagonal frequency-domain prior."""
     shape = spectrum.shape
     validate_budget(shape, n_samples, n_center)
     gain = _aopt_gain(spectrum, noise_var)

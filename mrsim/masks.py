@@ -1,4 +1,4 @@
-"""Baseline k-space sampling mask generators with exact sample budgets."""
+"""Baseline frequency-domain measurement mask generators with exact budgets."""
 
 from __future__ import annotations
 
@@ -20,7 +20,7 @@ def validate_budget(shape: tuple[int, int], n_samples: int, n_center: int = 0) -
 
 
 def radius_map(shape: tuple[int, int]) -> np.ndarray:
-    """Distance of each k-space location from the centered DC coefficient."""
+    """Distance of each frequency-domain location from the centered DC coefficient."""
     yy = np.arange(shape[0]) - shape[0] // 2
     xx = np.arange(shape[1]) - shape[1] // 2
     gy, gx = np.meshgrid(yy, xx, indexing="ij")
@@ -28,7 +28,7 @@ def radius_map(shape: tuple[int, int]) -> np.ndarray:
 
 
 def center_indices(shape: tuple[int, int], n_center: int) -> np.ndarray:
-    """Flat indices of the n_center locations closest to the k-space center."""
+    """Flat indices of the n_center locations closest to the frequency-domain center."""
     if n_center <= 0:
         return np.empty(0, dtype=np.int64)
     r = radius_map(shape).ravel()

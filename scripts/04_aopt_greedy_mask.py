@@ -28,7 +28,8 @@ def main() -> None:
     train, test = experiment.train_test_split(images, cfg)
 
     mask_dict = experiment.build_masks(["aopt_greedy"], cfg, train, rng)
-    frame = experiment.evaluate_masks(mask_dict, test, cfg, run, prefix="aopt")
+    spectrum = experiment.mean_power_spectrum(train)
+    frame = experiment.evaluate_masks(mask_dict, test, cfg, run, prefix="aopt", spectrum=spectrum)
 
     summary = frame.groupby(["mask", "method"])[["psnr", "ssim", "nrmse"]].mean()
     print(summary.round(4).to_string())

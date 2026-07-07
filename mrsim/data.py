@@ -1,4 +1,4 @@
-"""Synthetic phantom generation."""
+"""Synthetic test signal generation."""
 
 from __future__ import annotations
 
@@ -40,7 +40,7 @@ def random_ellipse_phantom(
     yy, xx = _coordinate_grid(size)
     image = np.zeros((size, size), dtype=np.float64)
 
-    # Large background ellipse so every phantom has a compact support.
+    # Large background ellipse so every test signal has a compact support.
     image += _ellipse(
         yy,
         xx,
@@ -63,7 +63,7 @@ def random_ellipse_phantom(
 
 
 def shepp_logan(size: int, rng: np.random.Generator | None = None) -> np.ndarray:
-    """Shepp-Logan phantom resized to `size`, optionally randomly rotated."""
+    """Classical Shepp-Logan test image resized to `size`, optionally randomly rotated."""
     image = shepp_logan_phantom()
     if rng is not None:
         image = rotate(image, angle=float(rng.uniform(-15.0, 15.0)), mode="constant")
@@ -79,7 +79,7 @@ def generate_dataset(
     min_ellipses: int = 3,
     max_ellipses: int = 8,
 ) -> torch.Tensor:
-    """Generate a stack of phantoms with shape (n_images, size, size)."""
+    """Generate a stack of synthetic test images with shape (n_images, size, size)."""
     rng = np.random.default_rng(seed)
     images = []
     for _ in range(n_images):

@@ -1,6 +1,7 @@
 numpy>=1.26
 scipy>=1.11
 scikit-image>=0.22
+PyWavelets>=1.4
 matplotlib>=3.8
 torch>=2.1
 PyYAML>=6.0

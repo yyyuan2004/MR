@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import warnings
 from pathlib import Path
 from typing import Any, Callable
 
@@ -54,7 +55,7 @@ def train_test_split(images: torch.Tensor, cfg: dict[str, Any]) -> tuple[torch.T
 # ---------------------------------------------------------------------------
 
 def mean_power_spectrum(images: torch.Tensor) -> np.ndarray:
-    """Mean centered k-space power |X_k|^2 over a stack of images."""
+    """Mean centered frequency-domain power |X_k|^2 over a stack of images."""
     k = fft2c(images.to(torch.complex64))
     return (k.abs() ** 2).mean(dim=0).numpy().astype(np.float64)
 
@@ -75,6 +76,19 @@ def fitted_power_law_spectrum(images: torch.Tensor) -> np.ndarray:
     return np.maximum(spectrum, 1e-12)
 
 
+def greedy_noise_var(cfg: dict[str, Any]) -> float:
+    """Noise variance assumed by the greedy selection criteria.
+
+    Invariant: defaults to measurement.noise_std ** 2 so the criterion assumes
+    exactly the noise that is simulated. greedy.noise_var overrides only when
+    set explicitly in the config.
+    """
+    g = cfg.get("greedy", {})
+    if "noise_var" in g and g["noise_var"] is not None:
+        return float(g["noise_var"])
+    return float(cfg.get("measurement", {}).get("noise_std", 0.0)) ** 2
+
+
 def mask_budgets(cfg: dict[str, Any]) -> tuple[tuple[int, int], int, int]:
     """Return (shape, n_samples, n_center) from the config."""
     size = int(cfg["data"]["image_size"])
@@ -93,7 +107,7 @@ def build_masks(
     """Build the requested masks by name, sharing one budget and prior."""
     shape, n_samples, n_center = mask_budgets(cfg)
     g = cfg.get("greedy", {})
-    noise_var = float(g.get("noise_var", 1e-3))
+    noise_var = greedy_noise_var(cfg)
 
     prior: np.ndarray | None = None
     builders: dict[str, Callable[[], np.ndarray]] = {
@@ -158,15 +172,47 @@ def reconstruct_all(
     mask: np.ndarray,
     cfg: dict[str, Any],
     generator: torch.Generator | None = None,
+    spectrum: np.ndarray | None = None,
 ) -> dict[str, torch.Tensor]:
-    """Simulate measurements and reconstruct with every configured method."""
+    """Simulate measurements and reconstruct with every configured method.
+
+    zero_filled and wiener are linear diagonal reconstructions: under a
+    diagonal prior the estimator's unsampled frequency coefficients stay at
+    the prior mean (zero), so both remain confined to the observed subspace
+    and their recon_nullspace_norm is ~0. wavelet_ista couples coefficients
+    across a non-Fourier basis and can impute null-space content; the
+    contrast is intentional.
+
+    spectrum is the mean frequency-domain power estimated on training data
+    only. wiener's regularization weight defaults to the simulated measurement
+    noise variance (recon.wiener_lambda overrides).
+    """
     noise_std = float(cfg.get("measurement", {}).get("noise_std", 0.0))
-    lam = float(cfg["recon"]["ridge_lambda"])
     y = recon.simulate_measurements(images, mask, noise_std=noise_std, generator=generator)
-    return {
-        "zero_filled": recon.zero_filled(y),
-        "ridge": recon.ridge(y, mask, lam),
-    }
+    out = {"zero_filled": recon.zero_filled(y)}
+
+    if spectrum is None:
+        warnings.warn(
+            "reconstruct_all: no spectrum provided; wiener falls back to scalar shrinkage",
+            stacklevel=2,
+        )
+        out["wiener"] = recon.ridge(y, mask, float(cfg["recon"]["ridge_lambda"]))
+    else:
+        lam = float(cfg["recon"].get("wiener_lambda", noise_std**2))
+        out["wiener"] = recon.ridge(y, mask, lam, spectrum=spectrum)
+
+    ista_cfg = cfg["recon"].get("wavelet_ista")
+    if ista_cfg:
+        out["wavelet_ista"] = recon.wavelet_ista(
+            y,
+            mask,
+            threshold=float(ista_cfg["threshold"]),
+            n_iters=int(ista_cfg.get("n_iters", 50)),
+            wavelet=str(ista_cfg.get("wavelet", "db4")),
+            levels=int(ista_cfg.get("levels", 3)),
+            final_dc=bool(ista_cfg.get("final_dc", True)),
+        )
+    return out
 
 
 def metrics_rows(
@@ -175,7 +221,12 @@ def metrics_rows(
     mask: np.ndarray,
     mask_name: str,
 ) -> list[dict[str, Any]]:
-    """Per-image metric rows for every method, including artifact metrics."""
+    """Per-image metric rows for every method, including artifact metrics.
+
+    Alongside the magnitude-based scalar metrics, each row carries the
+    observed-subspace / null-space error decomposition norms computed on the
+    complex reconstruction (before taking magnitudes).
+    """
     rows = []
     for method, batch in recons.items():
         for i in range(truth.shape[0]):
@@ -184,6 +235,12 @@ def metrics_rows(
             row: dict[str, Any] = {"mask": mask_name, "method": method, "image_index": i}
             row.update(metrics.evaluate(recon_i, truth_i))
             row["aliasing_energy_ratio"] = artifacts.aliasing_energy_ratio(truth[i], mask)
+            dec = artifacts.decompose_error(batch[i], truth[i], mask)
+            row["artifact_norm"] = dec.artifact_norm
+            row["consistency_norm"] = dec.consistency_norm
+            row["recon_nullspace_norm"] = dec.recon_nullspace_norm
+            row["truth_nullspace_norm"] = dec.truth_nullspace_norm
+            row["no_nullspace_content"] = dec.no_nullspace_content
             rows.append(row)
     return rows
 
@@ -191,14 +248,22 @@ def metrics_rows(
 def save_examples(
     truth: torch.Tensor,
     recons: dict[str, torch.Tensor],
+    mask: np.ndarray,
     mask_name: str,
     run: Path,
     indices: list[int],
 ) -> None:
-    """Save reconstruction and artifact-map grids for selected test images."""
+    """Save reconstruction, total-error, artifact-field, and null-space grids.
+
+    Total error |recon - truth| goes to artifact_maps/<mask>_<method>.png as
+    before; the null-space imputation error magnitude |artifact_field| and the
+    reconstruction's invented null-space content |(I - P) recon| get the
+    suffixes _artifact_field.png and _nullspace.png.
+    """
     for method, batch in recons.items():
         recon_images = [batch[i].abs().numpy() for i in indices]
         error_maps = [artifacts.artifact_map(batch[i], truth[i]).numpy() for i in indices]
+        decs = [artifacts.decompose_error(batch[i], truth[i], mask) for i in indices]
         titles = [f"test[{i}]" for i in indices]
         viz.save_image_grid(
             recon_images,
@@ -213,6 +278,18 @@ def save_examples(
             titles=titles,
             cmap="inferno",
         )
+        viz.save_image_grid(
+            [dec.artifact_field.abs().numpy() for dec in decs],
+            run / "artifact_maps" / f"{mask_name}_{method}_artifact_field.png",
+            titles=titles,
+            cmap="inferno",
+        )
+        viz.save_image_grid(
+            [dec.recon_nullspace.abs().numpy() for dec in decs],
+            run / "artifact_maps" / f"{mask_name}_{method}_nullspace.png",
+            titles=titles,
+            cmap="inferno",
+        )
 
 
 def evaluate_masks(
@@ -222,6 +299,7 @@ def evaluate_masks(
     run: Path,
     prefix: str,
     example_indices: list[int] | None = None,
+    spectrum: np.ndarray | None = None,
 ) -> pd.DataFrame:
     """Full evaluation of a set of masks: metrics CSV, examples, PSF metrics.
 
@@ -240,9 +318,9 @@ def evaluate_masks(
     psf_rows: list[dict[str, float]] = []
     for name, mask in mask_dict.items():
         psf_rows.append(save_mask_bundle(mask, name, run))
-        recons = reconstruct_all(test_images, mask, cfg, generator=generator)
+        recons = reconstruct_all(test_images, mask, cfg, generator=generator, spectrum=spectrum)
         all_rows.extend(metrics_rows(recons, test_images, mask, name))
-        save_examples(test_images, recons, name, run, example_indices)
+        save_examples(test_images, recons, mask, name, run, example_indices)
 
     _ensure_dir(run / "metrics")
     frame = pd.DataFrame(all_rows)

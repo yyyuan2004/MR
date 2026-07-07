@@ -1,9 +1,11 @@
 # MR
 
-Sampling-mask design and comparison toolkit for undersampled Fourier imaging.
-Generates synthetic phantoms, builds k-space sampling masks (random, structured,
-and greedy/data-driven), reconstructs with simple linear methods, and compares
-masks with reconstruction and artifact metrics.
+Measurement-mask design and comparison toolkit for undersampled
+frequency-domain inverse problems. Generates synthetic test signals, builds
+frequency-domain measurement masks (random, structured, and
+greedy/data-driven), reconstructs with linear and iterative methods, and
+compares masks with reconstruction and artifact metrics, including an
+observed-subspace / null-space error decomposition.
 
 ## Installation
 
@@ -24,7 +26,7 @@ pip install torch --index-url https://download.pytorch.org/whl/cpu
 ## Quickstart
 
 Run the default experiment (200 synthetic 64x64 images, 5 mask types,
-zero-filled and ridge reconstruction) from the repository root:
+zero-filled, Wiener, and wavelet-ISTA reconstruction) from the repository root:
 
 ```bash
 python scripts/07_compare_all_masks.py --config configs/default.yaml
@@ -42,11 +44,11 @@ pytest
 configs/            YAML experiment configs
 mrsim/              library code
   config.py         config loading, run dirs, seeding
-  data.py           synthetic phantom generation
+  data.py           synthetic test signal generation
   fft_ops.py        centered orthonormal FFT, forward/adjoint, projector
   masks.py          baseline mask generators (exact sample budgets)
   greedy.py         A-optimal, artifact-aware, and data-driven greedy selection
-  recon.py          measurement simulation, zero-filled and ridge reconstruction
+  recon.py          measurement simulation; zero-filled, Wiener, wavelet-ISTA reconstruction
   metrics.py        PSNR / SSIM / NRMSE / MSE
   artifacts.py      decomposition, artifact maps, PSF metrics, mask scores
   viz.py            image grids, PSF plots, scatter plots
@@ -79,7 +81,8 @@ each mask and score means.
 ## Comparing sampling masks
 
 `scripts/07_compare_all_masks.py` builds every mask listed under `mask.types`
-in the config, reconstructs the test split with zero-filled and ridge methods,
+in the config, reconstructs the test split with zero-filled, Wiener, and
+wavelet-ISTA methods,
 and writes:
 
 - `runs/<exp>/metrics/compare_metrics.csv` — per-image metrics per mask/method
