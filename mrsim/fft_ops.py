@@ -28,12 +28,12 @@ def as_mask_tensor(mask: np.ndarray | torch.Tensor) -> torch.Tensor:
 
 
 def forward_op(x: torch.Tensor, mask: np.ndarray | torch.Tensor) -> torch.Tensor:
-    """Forward operator A = M F: masked k-space of an image."""
+    """Forward operator A = M F: masked frequency-domain coefficients of a signal."""
     return as_mask_tensor(mask) * fft2c(x)
 
 
 def adjoint_op(y: torch.Tensor, mask: np.ndarray | torch.Tensor) -> torch.Tensor:
-    """Adjoint operator A^H = F^H M applied to k-space data."""
+    """Adjoint operator A^H = F^H M applied to frequency-domain data."""
     return ifft2c(as_mask_tensor(mask) * y)
 
 

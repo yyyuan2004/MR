@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """Default experiment: build every configured mask, reconstruct the test split
-with zero-filled and ridge methods, and compare masks.
+with zero-filled, Wiener, and wavelet-ISTA methods, and compare masks.
 
 Outputs (under runs/<experiment_name>/):
   metrics/compare_metrics.csv       per-image metrics for every mask x method
@@ -49,16 +49,18 @@ def main() -> None:
     print(f"building masks: {', '.join(mask_names)}")
     mask_dict = experiment.build_masks(mask_names, cfg, train, rng)
 
+    # Mean power spectrum of the train split: prior for wiener and mask scores.
+    train_power = experiment.mean_power_spectrum(train)
+
     # First pass to find representative examples, then evaluate with them.
     n_examples = int(cfg.get("outputs", {}).get("n_examples", 5))
-    frame = experiment.evaluate_masks(mask_dict, test, cfg, run, prefix="compare")
+    frame = experiment.evaluate_masks(mask_dict, test, cfg, run, prefix="compare", spectrum=train_power)
     examples = representative_indices(frame, n_examples, test.shape[0])
     frame = experiment.evaluate_masks(
-        mask_dict, test, cfg, run, prefix="compare", example_indices=examples
+        mask_dict, test, cfg, run, prefix="compare", example_indices=examples, spectrum=train_power
     )
 
     # Mask score: expected zero-filled MSE under the train mean power spectrum.
-    train_power = experiment.mean_power_spectrum(train)
     scores = {
         name: artifacts.expected_zero_filled_mse(mask, train_power)
         for name, mask in mask_dict.items()

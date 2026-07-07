@@ -30,7 +30,10 @@ def main() -> None:
     train, test = experiment.train_test_split(images, cfg)
 
     mask_dict = experiment.build_masks(BASELINES, cfg, train, rng)
-    frame = experiment.evaluate_masks(mask_dict, test, cfg, run, prefix="baselines")
+    spectrum = experiment.mean_power_spectrum(train)
+    frame = experiment.evaluate_masks(
+        mask_dict, test, cfg, run, prefix="baselines", spectrum=spectrum
+    )
 
     summary = frame.groupby(["mask", "method"])[["psnr", "ssim", "nrmse"]].mean()
     print(summary.round(4).to_string())

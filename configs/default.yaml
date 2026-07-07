@@ -12,11 +12,11 @@ data:
   max_ellipses: 8
 
 measurement:
-  noise_std: 0.005         # std of complex Gaussian k-space noise
+  noise_std: 0.005         # std of complex Gaussian frequency-domain noise
 
 mask:
   sampling_fraction: 0.25
-  center_fraction: 0.02    # fraction of the budget forced onto the k-space center
+  center_fraction: 0.02    # fraction of the budget forced onto the frequency-domain center
   variable_density_decay: 3.0
   types:                   # masks compared by scripts/07_compare_all_masks.py
     - uniform_random
@@ -26,12 +26,20 @@ mask:
     - artifact_aware_greedy
 
 greedy:
-  noise_var: 0.001         # noise variance in the A-optimal / artifact-aware score
+  # Invariant: the selection criterion's noise variance defaults to
+  # measurement.noise_std ** 2 (the simulated noise). Set greedy.noise_var
+  # here only to deliberately override that single source of truth.
   artifact_beta: 0.5       # weight of the PSF max-sidelobe penalty
   n_candidates: 32         # candidate locations evaluated per artifact-aware step
 
 recon:
   ridge_lambda: 0.05
+  wavelet_ista:
+    threshold: 0.02
+    n_iters: 50
+    wavelet: db4
+    levels: 3
+    final_dc: true
 
 outputs:
   n_examples: 5

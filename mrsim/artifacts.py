@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+from dataclasses import dataclass
+
 import numpy as np
 import torch
 
@@ -21,8 +23,82 @@ def decompose(images: torch.Tensor, mask: np.ndarray | torch.Tensor) -> dict[str
 
 
 def artifact_map(recon: torch.Tensor, truth: torch.Tensor) -> torch.Tensor:
-    """Pointwise magnitude of the complex reconstruction error."""
+    """Total error magnitude |recon - truth|.
+
+    Backward-compatibility wrapper. This conflates observed-subspace error with
+    null-space imputation error; use decompose_error for the structured split.
+    """
     return (recon.to(torch.complex64) - truth.to(torch.complex64)).abs()
+
+
+@dataclass
+class ErrorDecomposition:
+    """Reconstruction error split by the orthogonal projector P = F^H M F.
+
+    consistency_error lives in the observed subspace (range of P); the
+    artifact_field is the null-space part of the error, i.e. spurious or
+    missing null-space content relative to the reference signal.
+    """
+
+    total_error: torch.Tensor        # |recon - truth|, magnitude-valued
+    consistency_error: torch.Tensor  # P(recon - truth): complex, observed-subspace error
+    artifact_field: torch.Tensor     # (I - P)(recon - truth): complex, null-space imputation error
+    recon_nullspace: torch.Tensor    # (I - P) recon: complex, invented null-space content
+    truth_nullspace: torch.Tensor    # (I - P) truth: complex, reference null-space component
+
+    total_error_norm: float
+    consistency_norm: float
+    artifact_norm: float
+    recon_nullspace_norm: float
+    truth_nullspace_norm: float
+
+    no_nullspace_content: bool
+
+
+def decompose_error(
+    recon: torch.Tensor,
+    truth: torch.Tensor,
+    mask: np.ndarray | torch.Tensor,
+    *,
+    rel_tol: float = 1e-4,
+) -> ErrorDecomposition:
+    """Decompose reconstruction error into observed-subspace and null-space parts.
+
+    Single-image contract: recon and truth have shape (H, W); callers loop over
+    batches. Inputs are cast to complex64 internally. All projections reuse the
+    existing orthogonal projector; the null-space projection is computed as
+    (I - P) z = z - projector(z, mask).
+
+    no_nullspace_content is a norm-based flag: it is True whenever the
+    reconstruction's null-space content is negligible relative to the reference
+    signal norm. This holds for any reconstruction confined to the observed
+    subspace (zero-filling and every linear diagonal method), not only
+    zero-filling.
+    """
+    recon_c = recon.to(torch.complex64)
+    truth_c = truth.to(torch.complex64)
+
+    err = recon_c - truth_c
+    consistency_error = projector(err, mask)
+    artifact_field = err - consistency_error
+    recon_nullspace = recon_c - projector(recon_c, mask)
+    truth_nullspace = truth_c - projector(truth_c, mask)
+
+    recon_nullspace_norm = torch.linalg.vector_norm(recon_nullspace).item()
+    truth_norm = torch.linalg.vector_norm(truth_c).item()
+    return ErrorDecomposition(
+        total_error=err.abs(),
+        consistency_error=consistency_error,
+        artifact_field=artifact_field,
+        recon_nullspace=recon_nullspace,
+        truth_nullspace=truth_nullspace,
+        total_error_norm=torch.linalg.vector_norm(err).item(),
+        consistency_norm=torch.linalg.vector_norm(consistency_error).item(),
+        artifact_norm=torch.linalg.vector_norm(artifact_field).item(),
+        recon_nullspace_norm=recon_nullspace_norm,
+        truth_nullspace_norm=torch.linalg.vector_norm(truth_nullspace).item(),
+        no_nullspace_content=recon_nullspace_norm <= rel_tol * max(truth_norm, 1e-12),
+    )
 
 
 def aliasing_energy_ratio(image: torch.Tensor, mask: np.ndarray | torch.Tensor) -> float:
@@ -64,7 +140,7 @@ def psf_metrics(mask: np.ndarray) -> dict[str, float]:
 
 
 def expected_zero_filled_mse(mask: np.ndarray, mean_power: np.ndarray) -> float:
-    """Predicted per-pixel zero-filled MSE from a mean k-space power spectrum.
+    """Predicted per-pixel zero-filled MSE from a mean frequency-domain power spectrum.
 
     With the orthonormal FFT, the zero-filled error energy equals the spectral
     energy at unsampled locations (Parseval), so the expected per-pixel MSE is

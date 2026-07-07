@@ -28,9 +28,12 @@ does not exist, so each script is runnable on its own.
 - `data.n_train`, `data.n_test`: deterministic split (first `n_train` images
   train, next `n_test` test).
 - `data.phantom`: `ellipses` (random ellipse superpositions) or `shepp_logan`.
-- `measurement.noise_std`: std of complex Gaussian k-space noise.
-- `mask.sampling_fraction`: fraction of k-space locations sampled; the sample
-  budget is `round(fraction * H * W)` and is met exactly by every generator.
+- `measurement.noise_std`: std of complex Gaussian frequency-domain noise.
+  Single source of truth: the greedy criterion's noise variance and the
+  Wiener regularization weight both default to `noise_std ** 2`.
+- `mask.sampling_fraction`: fraction of frequency-domain locations measured;
+  the measurement budget is `round(fraction * H * W)` and is met exactly by
+  every generator.
 - `mask.center_fraction`: fraction of the budget forced onto the lowest
   spatial frequencies.
 - `mask.variable_density_decay`: polynomial decay exponent of the variable
@@ -39,11 +42,18 @@ does not exist, so each script is runnable on its own.
   `variable_density`, `equispaced_lines`, `aopt_greedy`,
   `artifact_aware_greedy`, `data_driven_greedy`.
 - `greedy.noise_var`: noise variance in the A-optimal gain
-  `s_k^2 / (s_k + noise_var)`.
+  `s_k^2 / (s_k + noise_var)`. Defaults to `measurement.noise_std ** 2`; set
+  it only to deliberately override that invariant.
 - `greedy.artifact_beta`: weight of the PSF max-sidelobe penalty in the
   artifact-aware score.
 - `greedy.n_candidates`: candidate locations evaluated per artifact-aware step.
-- `recon.ridge_lambda`: ridge regularization weight.
+- `recon.ridge_lambda`: scalar shrinkage weight, used only on the fallback
+  path when no spectrum is available.
+- `recon.wiener_lambda` (optional): Wiener regularization weight; defaults to
+  `measurement.noise_std ** 2`.
+- `recon.wavelet_ista`: iterative soft-thresholding parameters (`threshold`,
+  `n_iters`, `wavelet`, `levels`, `final_dc`). Remove the block to skip the
+  method.
 - `outputs.n_examples`: number of representative examples saved as image grids.
 
 ## Output layout
@@ -60,7 +70,9 @@ runs/<experiment_name>/
   metrics/<prefix>_psf_metrics.csv   PSF metrics per mask
   metrics/summary.csv                aggregated comparison (script 07)
   recon/<mask>_<method>.png          reconstruction grids
-  artifact_maps/<mask>_<method>.png  |recon - truth| grids
+  artifact_maps/<mask>_<method>.png  total error |recon - truth| grids
+  artifact_maps/<mask>_<method>_artifact_field.png  null-space error |(I-P)(recon-truth)|
+  artifact_maps/<mask>_<method>_nullspace.png       invented content |(I-P) recon|
   plots/score_vs_error.png           mask score vs measured error (script 07)
 ```
 
@@ -75,4 +87,11 @@ runs/<experiment_name>/
 - `psf_sidelobe_energy`: off-peak fraction of PSF energy (depends mostly on the
   budget; reported for completeness).
 - `mask_score`: expected zero-filled per-pixel MSE under the train mean power
-  spectrum (unsampled spectral energy / number of pixels).
+  spectrum (unmeasured spectral energy / number of pixels).
+- `artifact_norm`, `consistency_norm`, `recon_nullspace_norm`,
+  `truth_nullspace_norm`, `no_nullspace_content`: per-image error
+  decomposition by the orthogonal projector `P = F^H M F` — null-space
+  imputation error, observed-subspace error, the reconstruction's and the
+  reference signal's null-space content, and a norm-based flag that is True
+  for reconstructions confined to the observed subspace. See
+  `docs/experiments.md`.

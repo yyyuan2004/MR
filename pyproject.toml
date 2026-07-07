@@ -5,7 +5,7 @@ build-backend = "setuptools.build_meta"
 [project]
 name = "mrsim"
 version = "0.1.0"
-description = "Sampling-mask design and comparison toolkit for undersampled Fourier imaging"
+description = "Measurement-mask design and comparison toolkit for undersampled frequency-domain inverse problems"
 readme = "README.md"
 requires-python = ">=3.11"
 dependencies = [
