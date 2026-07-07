@@ -14,7 +14,7 @@ Requires Python 3.12+ (runs on 3.11 as well).
 ```bash
 python -m venv .venv
 source .venv/bin/activate
-pip install -r requirements.txt
+pip install -r requirements.txt -i https://pypi.tuna.tsinghua.edu.cn/simple
 ```
 
 CPU-only PyTorch is sufficient:
