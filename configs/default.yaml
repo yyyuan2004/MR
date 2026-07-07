@@ -4,7 +4,7 @@ seed: 0
 
 data:
   n_images: 200
-  image_size: 64
+  image_size: 256
   n_train: 120
   n_test: 80
   phantom: ellipses        # ellipses | shepp_logan
