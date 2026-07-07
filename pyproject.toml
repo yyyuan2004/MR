@@ -1,0 +1,28 @@
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "mrsim"
+version = "0.1.0"
+description = "Sampling-mask design and comparison toolkit for undersampled Fourier imaging"
+readme = "README.md"
+requires-python = ">=3.11"
+dependencies = [
+    "numpy>=1.26",
+    "scipy>=1.11",
+    "scikit-image>=0.22",
+    "matplotlib>=3.8",
+    "torch>=2.1",
+    "PyYAML>=6.0",
+    "pandas>=2.1",
+]
+
+[project.optional-dependencies]
+dev = ["pytest>=7.4"]
+
+[tool.setuptools]
+packages = ["mrsim"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
