@@ -46,8 +46,10 @@ mrsim/              library code
   config.py         config loading, run dirs, seeding
   data.py           synthetic test signal generation
   fft_ops.py        centered orthonormal FFT, forward/adjoint, projector
-  masks.py          baseline mask generators (exact sample budgets)
-  greedy.py         A-optimal, artifact-aware, and data-driven greedy selection
+  masks.py          baseline mask generators, point- and line-wise (exact budgets)
+  greedy.py         greedy selection: A-optimal, PSF-penalized, data-driven,
+                    line-wise, wavelet-leakage, reconstruction-in-the-loop
+  progress.py       dependency-free progress reporting
   recon.py          measurement simulation; zero-filled, Wiener, wavelet-ISTA reconstruction
   metrics.py        PSNR / SSIM / NRMSE / MSE
   artifacts.py      decomposition, artifact maps, PSF metrics, mask scores

@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import time
 import warnings
 from pathlib import Path
 from typing import Any, Callable
@@ -12,6 +13,7 @@ import torch
 
 from . import artifacts, data, greedy, masks, metrics, recon, viz
 from .fft_ops import fft2c
+from .progress import track
 
 
 # ---------------------------------------------------------------------------
@@ -109,27 +111,76 @@ def build_masks(
     g = cfg.get("greedy", {})
     noise_var = greedy_noise_var(cfg)
 
+    mask_cfg = cfg.get("mask", {})
+    lines_cfg = mask_cfg.get("lines", {})
+    ml_cfg = mask_cfg.get("multilevel", {})
+    ista_cfg = cfg.get("recon", {}).get("wavelet_ista", {})
+    loop_cfg = g.get("recon_in_loop", {})
+    n_center_lines = int(lines_cfg.get("n_center_lines", 2))
+    wavelet = str(ista_cfg.get("wavelet", "db4"))
+    levels = int(ista_cfg.get("levels", 3))
+    beta = float(g.get("beta", g.get("artifact_beta", 1.0)))
+
+    def _psf_penalized() -> np.ndarray:
+        return greedy.greedy_psf_penalized_aopt(
+            _prior(), n_samples,
+            noise_var=noise_var,
+            beta=beta,
+            n_candidates=int(g.get("n_candidates", 32)),
+            n_center=n_center,
+            rng=rng,
+            show_progress=True,
+        )
+
     prior: np.ndarray | None = None
     builders: dict[str, Callable[[], np.ndarray]] = {
         "uniform_random": lambda: masks.uniform_random_mask(shape, n_samples, rng, n_center),
         "variable_density": lambda: masks.variable_density_mask(
             shape, n_samples, rng,
-            decay=float(cfg["mask"].get("variable_density_decay", 3.0)),
+            decay=float(mask_cfg.get("variable_density_decay", 3.0)),
             n_center=n_center,
         ),
         "equispaced_lines": lambda: masks.equispaced_lines_mask(shape, n_samples),
+        "variable_density_lines": lambda: masks.variable_density_lines_mask(
+            shape, n_samples, rng,
+            decay=float(lines_cfg.get("decay", 2.0)),
+            n_center_lines=n_center_lines,
+        ),
+        "multilevel_random": lambda: masks.multilevel_random_mask(
+            shape, n_samples, rng,
+            n_levels=int(ml_cfg.get("n_levels", 4)),
+            decay=float(ml_cfg.get("decay", 1.5)),
+        ),
         "aopt_greedy": lambda: greedy.greedy_a_optimal(
             _prior(), n_samples, noise_var=noise_var, n_center=n_center
         ),
-        "artifact_aware_greedy": lambda: greedy.greedy_artifact_aware(
-            _prior(), n_samples,
-            noise_var=noise_var,
-            beta=float(g.get("artifact_beta", 0.5)),
-            n_candidates=int(g.get("n_candidates", 32)),
-            n_center=n_center,
-        ),
+        "psf_penalized_aopt_greedy": _psf_penalized,
+        # Backward-compatibility alias for the pre-rename mask type name.
+        "artifact_aware_greedy": _psf_penalized,
         "data_driven_greedy": lambda: greedy.greedy_data_driven(
             train_images.numpy(), n_samples, n_center=n_center
+        ),
+        "line_aopt": lambda: greedy.greedy_line_a_optimal(
+            _prior(), n_samples, noise_var=noise_var, n_center_lines=n_center_lines
+        ),
+        "line_subspace_leakage": lambda: greedy.greedy_lines_subspace_leakage(
+            train_images.numpy(), n_samples,
+            wavelet=wavelet, levels=levels, n_center_lines=n_center_lines,
+        ),
+        "spectrum_energy_greedy": lambda: greedy.greedy_lines_spectrum_energy(
+            train_images.numpy(), n_samples, n_center_lines=n_center_lines
+        ),
+        "recon_in_loop_greedy": lambda: greedy.greedy_lines_recon_in_loop(
+            train_images.numpy(), n_samples,
+            n_candidate_lines=int(loop_cfg.get("n_candidate_lines", 12)),
+            batch_size=int(loop_cfg.get("batch_size", 8)),
+            ista_threshold=float(ista_cfg.get("threshold", 0.02)),
+            ista_iters=int(loop_cfg.get("ista_iters", 6)),
+            wavelet=wavelet,
+            levels=levels,
+            n_center_lines=n_center_lines,
+            rng=rng,
+            show_progress=True,
         ),
     }
 
@@ -143,7 +194,9 @@ def build_masks(
     for name in names:
         if name not in builders:
             raise ValueError(f"unknown mask type {name!r}; known: {sorted(builders)}")
+        started = time.monotonic()
         out[name] = builders[name]()
+        print(f"  built {name} ({time.monotonic() - started:.1f}s)")
     return out
 
 
@@ -308,22 +361,32 @@ def evaluate_masks(
     """
     generator = torch.Generator().manual_seed(int(cfg["seed"]))
     n_examples = int(cfg.get("outputs", {}).get("n_examples", 5))
-    if example_indices is None:
-        # Evenly spaced test indices as representative examples.
-        example_indices = np.unique(
-            np.linspace(0, test_images.shape[0] - 1, n_examples).astype(int)
-        ).tolist()
 
     all_rows: list[dict[str, Any]] = []
     psf_rows: list[dict[str, float]] = []
-    for name, mask in mask_dict.items():
+    recons_by_mask: dict[str, dict[str, torch.Tensor]] = {}
+    for name in track(mask_dict, total=len(mask_dict), label=f"evaluate[{prefix}]"):
+        mask = mask_dict[name]
         psf_rows.append(save_mask_bundle(mask, name, run))
         recons = reconstruct_all(test_images, mask, cfg, generator=generator, spectrum=spectrum)
+        recons_by_mask[name] = recons
         all_rows.extend(metrics_rows(recons, test_images, mask, name))
-        save_examples(test_images, recons, mask, name, run, example_indices)
+
+    frame = pd.DataFrame(all_rows)
+    if example_indices is None:
+        example_indices = representative_indices(frame, n_examples, test_images.shape[0])
+    for name, mask in mask_dict.items():
+        save_examples(test_images, recons_by_mask[name], mask, name, run, example_indices)
 
     _ensure_dir(run / "metrics")
-    frame = pd.DataFrame(all_rows)
     frame.to_csv(run / "metrics" / f"{prefix}_metrics.csv", index=False)
     pd.DataFrame(psf_rows).to_csv(run / "metrics" / f"{prefix}_psf_metrics.csv", index=False)
     return frame
+
+
+def representative_indices(frame: pd.DataFrame, n_examples: int, n_test: int) -> list[int]:
+    """Test indices spread across the difficulty range (quantiles of mean NRMSE)."""
+    per_image = frame.groupby("image_index")["nrmse"].mean().reindex(range(n_test))
+    order = per_image.sort_values().index.to_numpy()
+    positions = np.unique(np.linspace(0, len(order) - 1, n_examples).astype(int))
+    return sorted(int(order[p]) for p in positions)
