@@ -18,22 +18,39 @@ mask:
   sampling_fraction: 0.25
   center_fraction: 0.02    # fraction of the budget forced onto the frequency-domain center
   variable_density_decay: 3.0
+  lines:                   # shared by all Cartesian column (line-wise) masks
+    n_center_lines: 2      # columns around the center that are always taken
+    decay: 2.0             # density decay for variable_density_lines
+  multilevel:
+    n_levels: 4            # dyadic radial annuli
+    decay: 1.5             # per-level density falloff 2^(-decay * level)
   types:                   # masks compared by scripts/07_compare_all_masks.py
     - uniform_random
     - variable_density
     - equispaced_lines
+    - variable_density_lines
+    - multilevel_random
     - aopt_greedy
-    - artifact_aware_greedy
+    - psf_penalized_aopt_greedy
+    - line_aopt
+    - line_subspace_leakage
+    - spectrum_energy_greedy
+    - recon_in_loop_greedy
 
 greedy:
   # Invariant: the selection criterion's noise variance defaults to
   # measurement.noise_std ** 2 (the simulated noise). Set greedy.noise_var
   # here only to deliberately override that single source of truth.
-  artifact_beta: 0.5       # weight of the PSF max-sidelobe penalty
-  n_candidates: 32         # candidate locations evaluated per artifact-aware step
+  beta: 1.0                # weight of the (spectrum-weighted) PSF sidelobe penalty
+  beta_sweep: [0.0, 0.5, 1.0, 2.0, 4.0]   # used by scripts/05 --beta-sweep
+  n_candidates: 32         # hybrid candidate pool size per PSF-penalized step
+  recon_in_loop:           # parameters of the reconstruction-in-the-loop selector
+    n_candidate_lines: 12
+    batch_size: 8
+    ista_iters: 6
 
 recon:
-  ridge_lambda: 0.05
+  ridge_lambda: 0.05       # scalar fallback only (no spectrum available)
   wavelet_ista:
     threshold: 0.02
     n_iters: 50

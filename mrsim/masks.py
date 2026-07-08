@@ -76,6 +76,29 @@ def variable_density_mask(
     return mask_from_indices(shape, np.concatenate([center, chosen]))
 
 
+def fill_lines(shape: tuple[int, int], cols_by_priority: np.ndarray, n_samples: int) -> np.ndarray:
+    """Build a Cartesian column mask from a priority-ordered column list.
+
+    The highest-priority columns are fully sampled; the last needed column is
+    filled partially (rows from the center outward) so the measurement budget
+    is met exactly.
+    """
+    validate_budget(shape, n_samples)
+    n_rows = shape[0]
+    n_full = n_samples // n_rows
+    remainder = n_samples - n_full * n_rows
+    needed = n_full + (1 if remainder else 0)
+    if needed > cols_by_priority.size:
+        raise ValueError(f"need {needed} columns but only {cols_by_priority.size} were provided")
+
+    mask = np.zeros(shape, dtype=np.float32)
+    mask[:, cols_by_priority[:n_full]] = 1.0
+    if remainder > 0:
+        rows = np.argsort(np.abs(np.arange(n_rows) - n_rows // 2), kind="stable")[:remainder]
+        mask[rows, cols_by_priority[n_full]] = 1.0
+    return mask
+
+
 def equispaced_lines_mask(shape: tuple[int, int], n_samples: int) -> np.ndarray:
     """Fully sampled columns on a regular grid.
 
@@ -91,13 +114,89 @@ def equispaced_lines_mask(shape: tuple[int, int], n_samples: int) -> np.ndarray:
     nearest = cols[np.argmin(np.abs(cols - n_cols_total // 2))]
     cols = (cols + (n_cols_total // 2 - nearest)) % n_cols_total
     order = np.argsort(np.abs(cols - n_cols_total // 2), kind="stable")
+    return fill_lines(shape, cols[order], n_samples)
 
-    mask = np.zeros(shape, dtype=np.float32)
-    n_full = n_samples // n_rows
-    mask[:, cols[order[:n_full]]] = 1.0
-    remainder = n_samples - n_full * n_rows
-    if remainder > 0:
-        partial_col = cols[order[n_full]]
-        rows = np.argsort(np.abs(np.arange(n_rows) - n_rows // 2), kind="stable")[:remainder]
-        mask[rows, partial_col] = 1.0
-    return mask
+
+def variable_density_lines_mask(
+    shape: tuple[int, int],
+    n_samples: int,
+    rng: np.random.Generator,
+    decay: float = 2.0,
+    n_center_lines: int = 2,
+) -> np.ndarray:
+    """Random Cartesian columns with polynomially decaying density.
+
+    A block of n_center_lines columns around the frequency-domain center is
+    always fully prioritized; the rest are drawn without replacement with
+    probability decaying polynomially in the column offset from the center.
+    """
+    validate_budget(shape, n_samples)
+    n_rows, n_cols_total = shape
+    needed = int(np.ceil(n_samples / n_rows))
+    n_center_lines = min(n_center_lines, needed)
+
+    offsets = np.abs(np.arange(n_cols_total) - n_cols_total // 2)
+    center_cols = np.argsort(offsets, kind="stable")[:n_center_lines].astype(np.int64)
+    remaining = np.setdiff1d(np.arange(n_cols_total, dtype=np.int64), center_cols)
+    prob = (1.0 + offsets[remaining] / (0.1 * n_cols_total)) ** (-decay)
+    prob /= prob.sum()
+    drawn = rng.choice(remaining, size=needed - n_center_lines, replace=False, p=prob)
+    # Center columns first, then random draws from nearest to farthest, so the
+    # partial column (if any) lands on the least central random draw.
+    drawn = drawn[np.argsort(offsets[drawn], kind="stable")]
+    return fill_lines(shape, np.concatenate([center_cols, drawn]), n_samples)
+
+
+def multilevel_random_mask(
+    shape: tuple[int, int],
+    n_samples: int,
+    rng: np.random.Generator,
+    n_levels: int = 4,
+    decay: float = 1.5,
+) -> np.ndarray:
+    """Multilevel random sampling over dyadic radial annuli.
+
+    The frequency plane is split into n_levels annuli with dyadic radii; each
+    level gets a share of the budget proportional to its area times a
+    per-level density 2^(-decay * level), capped at full sampling. Within a
+    level, locations are drawn uniformly without replacement. Leftover budget
+    cascades outward (and back inward) so the total is met exactly.
+    """
+    validate_budget(shape, n_samples)
+    r = radius_map(shape).ravel()
+    r_max = float(r.max())
+    # Dyadic annulus edges: [0, r_max/2^(L-1), ..., r_max/2, r_max].
+    edges = [0.0] + [r_max / 2 ** (n_levels - 1 - l) for l in range(n_levels)]
+    level_of = np.digitize(r, edges[1:-1])
+    sizes = np.bincount(level_of, minlength=n_levels)
+
+    density = 2.0 ** (-decay * np.arange(n_levels))
+    weights = sizes * density
+    targets = np.floor(n_samples * weights / weights.sum()).astype(np.int64)
+    targets = np.minimum(targets, sizes)
+    # Distribute the remaining budget innermost-first into levels with room.
+    shortfall = n_samples - int(targets.sum())
+    for level in list(range(n_levels)) * 2:
+        if shortfall <= 0:
+            break
+        room = int(sizes[level] - targets[level])
+        add = min(room, shortfall)
+        targets[level] += add
+        shortfall -= add
+
+    chosen = [
+        rng.choice(np.flatnonzero(level_of == level), size=int(targets[level]), replace=False)
+        for level in range(n_levels)
+        if targets[level] > 0
+    ]
+    return mask_from_indices(shape, np.concatenate(chosen))
+
+
+def jaccard(mask_a: np.ndarray, mask_b: np.ndarray) -> float:
+    """Jaccard overlap |A and B| / |A or B| between two binary masks."""
+    a = mask_a > 0.5
+    b = mask_b > 0.5
+    union = float(np.logical_or(a, b).sum())
+    if union == 0.0:
+        return 1.0
+    return float(np.logical_and(a, b).sum()) / union

@@ -5,6 +5,7 @@ from __future__ import annotations
 from dataclasses import dataclass
 
 import numpy as np
+import pywt
 import torch
 
 from .fft_ops import projector
@@ -137,6 +138,114 @@ def psf_metrics(mask: np.ndarray) -> dict[str, float]:
         "psf_max_sidelobe": float(side.max() / peak),
         "psf_sidelobe_energy": float((side**2).sum() / max(total_energy, 1e-12)),
     }
+
+
+def spectrum_weighted_psf_metrics(
+    mask: np.ndarray, spectrum: np.ndarray, guard_radius: float = 3.0
+) -> dict[str, float]:
+    """Sidelobe metrics of the prior-weighted PSF.
+
+    The plain PSF treats every frequency equally, so its metrics cannot by
+    themselves rank masks whose difference lies in *where* spectral energy
+    sits. Weighting the mask by a prior power spectrum before the transform
+    measures coherent aliasing of the expected signal.
+
+    The weighted PSF is dominated by the prior's autocorrelation main lobe
+    (steep priors concentrate energy at the frequency-domain center), so lags
+    within guard_radius of the peak are excluded; without the guard the
+    metric saturates near 1 for every mask and cannot rank them.
+    """
+    weighted = np.fft.fftshift(
+        np.fft.ifft2(np.fft.ifftshift(mask * spectrum), norm="ortho")
+    )
+    mag = np.abs(weighted)
+    cy, cx = mask.shape[0] // 2, mask.shape[1] // 2
+    peak = float(mag[cy, cx])
+    if peak == 0.0:
+        raise ValueError("mask/spectrum product is zero; weighted PSF peak is zero")
+    yy, xx = np.meshgrid(
+        np.arange(mask.shape[0]) - cy, np.arange(mask.shape[1]) - cx, indexing="ij"
+    )
+    side = mag.copy()
+    side[np.hypot(yy, xx) <= guard_radius] = 0.0
+    return {"weighted_max_sidelobe": float(side.max() / peak)}
+
+
+def subband_spectral_mass(
+    shape: tuple[int, int], wavelet: str = "db4", levels: int = 3
+) -> dict[str, np.ndarray]:
+    """Normalized frequency-domain energy distribution of each wavelet subband.
+
+    Atoms within one subband are translates of each other, so they share one
+    magnitude spectrum; a single centered atom per subband suffices. Each
+    returned array sums to 1 over the frequency grid.
+    """
+    template = pywt.wavedec2(
+        np.zeros(shape), wavelet=wavelet, mode="periodization", level=levels
+    )
+    mass: dict[str, np.ndarray] = {}
+
+    def atom_mass(coeffs: list) -> np.ndarray:
+        atom = pywt.waverec2(coeffs, wavelet=wavelet, mode="periodization")
+        power = np.abs(np.fft.fftshift(np.fft.fft2(np.fft.ifftshift(atom), norm="ortho"))) ** 2
+        return power / power.sum()
+
+    approx = [np.zeros_like(template[0])] + [
+        tuple(np.zeros_like(d) for d in band) for band in template[1:]
+    ]
+    cy, cx = template[0].shape[0] // 2, template[0].shape[1] // 2
+    approx[0][cy, cx] = 1.0
+    mass["approx"] = atom_mass(approx)
+    approx[0][cy, cx] = 0.0
+
+    for level_index, band in enumerate(template[1:], start=1):
+        for detail_index, name in enumerate(("horizontal", "vertical", "diagonal")):
+            coeffs = [np.zeros_like(template[0])] + [
+                tuple(np.zeros_like(d) for d in b) for b in template[1:]
+            ]
+            target = coeffs[level_index][detail_index]
+            target[target.shape[0] // 2, target.shape[1] // 2] = 1.0
+            mass[f"level{level_index}_{name}"] = atom_mass(coeffs)
+    return mass
+
+
+def subband_energies(
+    images: np.ndarray, wavelet: str = "db4", levels: int = 3
+) -> dict[str, float]:
+    """Total wavelet-coefficient energy per subband over a stack of images."""
+    coeffs = pywt.wavedec2(
+        np.asarray(images, dtype=np.float64),
+        wavelet=wavelet,
+        mode="periodization",
+        level=levels,
+        axes=(-2, -1),
+    )
+    energies = {"approx": float((np.abs(coeffs[0]) ** 2).sum())}
+    for level_index, band in enumerate(coeffs[1:], start=1):
+        for detail, name in zip(band, ("horizontal", "vertical", "diagonal")):
+            energies[f"level{level_index}_{name}"] = float((np.abs(detail) ** 2).sum())
+    return energies
+
+
+def wavelet_leakage_score(
+    mask: np.ndarray,
+    mass: dict[str, np.ndarray],
+    energies: dict[str, float],
+) -> float:
+    """Energy-weighted null-space leakage of the wavelet basis under a mask.
+
+    For each subband, the fraction of its atoms' spectral mass that falls on
+    unmeasured locations is the share of that subband's content lost to the
+    null space (a diagonal surrogate: cross-atom interference is ignored).
+    Weighting by training-data subband energies gives the expected null-space
+    energy of the reconstruction basis — an information-coverage score that,
+    unlike plain PSF coherence, accounts for where signal energy actually is.
+    Lower is better.
+    """
+    unmeasured = 1.0 - mask
+    total_energy = sum(energies.values())
+    leak = sum(energies[key] * float((mass[key] * unmeasured).sum()) for key in mass)
+    return leak / max(total_energy, 1e-12)
 
 
 def expected_zero_filled_mse(mask: np.ndarray, mean_power: np.ndarray) -> float:
