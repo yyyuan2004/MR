@@ -62,6 +62,73 @@ def ridge(
     return ifft2c(mask_t * weight * y)
 
 
+def subspace_recon(
+    y: torch.Tensor,
+    mask: np.ndarray | torch.Tensor,
+    basis: np.ndarray,
+    lam: float = 1e-6,
+) -> torch.Tensor:
+    """Closed-form reconstruction under a subspace/manifold prior.
+
+    Solves alpha_hat = (Phi_Omega^H Phi_Omega + lam I)^-1 Phi_Omega^H y_Omega
+    with Phi = F B, then returns x_hat = B alpha_hat. The Tikhonov weight lam
+    should match the measurement noise variance (the pipeline passes it).
+
+    Intentional new phenomenon: x_hat lies in the span of the basis, not in
+    the observed subspace, so unlike zero-filling and Wiener this linear
+    method has recon_nullspace_norm > 0 — the prior extrapolates measured
+    coefficients into the null space. Whether that imputation is faithful is
+    exactly what decompose_error measures.
+    """
+    from .subspace import to_kspace_basis
+
+    mask_np = mask.numpy() if isinstance(mask, torch.Tensor) else np.asarray(mask)
+    shape = mask_np.shape
+    omega = np.flatnonzero(mask_np.ravel() > 0.5)
+    basis = np.asarray(basis)
+    phi_omega = to_kspace_basis(basis, shape)[omega]
+
+    single = y.ndim == 2
+    batch = y[None] if single else y
+    y_omega = batch.numpy().astype(np.complex128).reshape(batch.shape[0], -1)[:, omega]
+
+    gram = phi_omega.conj().T @ phi_omega + lam * np.eye(basis.shape[1])
+    alpha = np.linalg.solve(gram, phi_omega.conj().T @ y_omega.T)
+    x = (basis.astype(np.complex128) @ alpha).T.reshape(batch.shape)
+    out = torch.from_numpy(x.astype(np.complex64))
+    return out[0] if single else out
+
+
+def generative_recon(
+    y: torch.Tensor,
+    mask: np.ndarray | torch.Tensor,
+    generator,
+    z_init: torch.Tensor,
+    steps: int = 200,
+    lr: float = 0.05,
+) -> torch.Tensor:
+    """Latent-space reconstruction min_z ||M F G(z) - y||^2 by gradient descent.
+
+    The generator maps a latent vector to an image; optimization runs in the
+    latent space with Adam from z_init (single-image contract, deterministic
+    given z_init). Like subspace_recon, the output lives on the generator
+    manifold rather than in the observed subspace, so it imputes null-space
+    content.
+    """
+    mask_t = as_mask_tensor(mask)
+    y = y.to(torch.complex64)
+    z = z_init.clone().detach().requires_grad_(True)
+    optimizer = torch.optim.Adam([z], lr=lr)
+    for _ in range(steps):
+        optimizer.zero_grad()
+        residual = mask_t * fft2c(generator(z).to(torch.complex64)) - y
+        loss = (residual.abs() ** 2).sum()
+        loss.backward()
+        optimizer.step()
+    with torch.no_grad():
+        return generator(z).detach().to(torch.complex64)
+
+
 class IstaResult(NamedTuple):
     """Wavelet-ISTA output with the per-iteration objective values."""
 

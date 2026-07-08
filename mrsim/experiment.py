@@ -11,7 +11,7 @@ import numpy as np
 import pandas as pd
 import torch
 
-from . import artifacts, data, greedy, masks, metrics, recon, viz
+from . import artifacts, data, greedy, masks, metrics, recon, subspace, viz
 from .fft_ops import fft2c
 from .progress import track
 
@@ -76,6 +76,14 @@ def fitted_power_law_spectrum(images: torch.Tensor) -> np.ndarray:
     slope, intercept = np.polyfit(x, y, 1)
     spectrum = np.exp(intercept) * (1.0 + r) ** slope
     return np.maximum(spectrum, 1e-12)
+
+
+def fit_train_subspace(
+    cfg: dict[str, Any], train_images: torch.Tensor
+) -> tuple[np.ndarray, float]:
+    """Fit the config-sized subspace basis on the train split."""
+    d = int(cfg.get("subspace", {}).get("d", 32))
+    return subspace.fit_subspace(train_images, d)
 
 
 def greedy_noise_var(cfg: dict[str, Any]) -> float:
@@ -170,6 +178,18 @@ def build_masks(
         "spectrum_energy_greedy": lambda: greedy.greedy_lines_spectrum_energy(
             train_images.numpy(), n_samples, n_center_lines=n_center_lines
         ),
+        "subspace_aopt_greedy": lambda: greedy.greedy_subspace_aoptimal(
+            subspace.to_kspace_basis(
+                fit_train_subspace(cfg, train_images)[0], shape
+            ),
+            n_samples,
+            sigma2=noise_var,
+            n_center=n_center,
+            beta=float(cfg.get("subspace", {}).get("beta", 0.0)),
+            shape=shape,
+            ridge=float(cfg.get("subspace", {}).get("ridge", 1e-6)),
+            n_candidates=int(g.get("n_candidates", 32)),
+        ),
         "recon_in_loop_greedy": lambda: greedy.greedy_lines_recon_in_loop(
             train_images.numpy(), n_samples,
             n_candidate_lines=int(loop_cfg.get("n_candidate_lines", 12)),
@@ -226,6 +246,9 @@ def reconstruct_all(
     cfg: dict[str, Any],
     generator: torch.Generator | None = None,
     spectrum: np.ndarray | None = None,
+    subspace_basis: np.ndarray | None = None,
+    gen_model=None,
+    gen_z0: torch.Tensor | None = None,
 ) -> dict[str, torch.Tensor]:
     """Simulate measurements and reconstruct with every configured method.
 
@@ -239,6 +262,13 @@ def reconstruct_all(
     spectrum is the mean frequency-domain power estimated on training data
     only. wiener's regularization weight defaults to the simulated measurement
     noise variance (recon.wiener_lambda overrides).
+
+    With subspace_basis (N x d, fitted on training data), the "subspace"
+    method solves the prior-constrained least squares in closed form; its
+    output lives in the basis span, so it imputes null-space content by
+    construction (recon_nullspace_norm > 0 — intentional; see
+    recon.subspace_recon). With gen_model and gen_z0, the "generative" method
+    optimizes the latent code of a fixed generator per image.
     """
     noise_std = float(cfg.get("measurement", {}).get("noise_std", 0.0))
     y = recon.simulate_measurements(images, mask, noise_std=noise_std, generator=generator)
@@ -265,6 +295,23 @@ def reconstruct_all(
             levels=int(ista_cfg.get("levels", 3)),
             final_dc=bool(ista_cfg.get("final_dc", True)),
         )
+
+    sub_cfg = cfg.get("subspace", {})
+    if subspace_basis is not None:
+        lam = sub_cfg.get("lam")
+        lam = float(lam) if lam is not None else max(noise_std**2, 1e-8)
+        out["subspace"] = recon.subspace_recon(y, mask, subspace_basis, lam=lam)
+    if gen_model is not None and gen_z0 is not None:
+        gen_cfg = sub_cfg.get("generative", {})
+        singles = [
+            recon.generative_recon(
+                y[i], mask, gen_model, gen_z0,
+                steps=int(gen_cfg.get("steps", 200)),
+                lr=float(gen_cfg.get("lr", 0.05)),
+            )
+            for i in range(y.shape[0])
+        ]
+        out["generative"] = torch.stack(singles)
     return out
 
 
@@ -353,6 +400,7 @@ def evaluate_masks(
     prefix: str,
     example_indices: list[int] | None = None,
     spectrum: np.ndarray | None = None,
+    subspace_basis: np.ndarray | None = None,
 ) -> pd.DataFrame:
     """Full evaluation of a set of masks: metrics CSV, examples, PSF metrics.
 
@@ -368,7 +416,10 @@ def evaluate_masks(
     for name in track(mask_dict, total=len(mask_dict), label=f"evaluate[{prefix}]"):
         mask = mask_dict[name]
         psf_rows.append(save_mask_bundle(mask, name, run))
-        recons = reconstruct_all(test_images, mask, cfg, generator=generator, spectrum=spectrum)
+        recons = reconstruct_all(
+            test_images, mask, cfg,
+            generator=generator, spectrum=spectrum, subspace_basis=subspace_basis,
+        )
         recons_by_mask[name] = recons
         all_rows.extend(metrics_rows(recons, test_images, mask, name))
 

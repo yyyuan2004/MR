@@ -248,6 +248,31 @@ def wavelet_leakage_score(
     return leak / max(total_energy, 1e-12)
 
 
+def subspace_nullspace_leakage(
+    basis: np.ndarray,
+    mask: np.ndarray,
+    weights: np.ndarray | None = None,
+) -> float:
+    """Fraction of subspace-basis energy lost to the null space under a mask.
+
+    For Phi = F B, column j loses sum_{k unmeasured} |Phi_kj|^2 of its energy
+    to the null space. The columns are combined weighted by their energy
+    (optionally rescaled by `weights`, e.g. singular values), which reduces to
+    ||(I - P) B W||_F^2 / ||B W||_F^2 — the subspace analogue of
+    aliasing_energy_ratio. Lower means the mask observes more of the prior
+    model; 0 means the subspace is fully measured.
+    """
+    from .subspace import to_kspace_basis
+
+    phi = to_kspace_basis(np.asarray(basis), mask.shape)
+    power = np.abs(phi) ** 2
+    scale = np.ones(phi.shape[1]) if weights is None else np.asarray(weights, dtype=np.float64) ** 2
+    unmeasured = (1.0 - mask.ravel())[:, None]
+    lost = float((power * unmeasured).sum(axis=0) @ scale)
+    total = float(power.sum(axis=0) @ scale)
+    return lost / max(total, 1e-30)
+
+
 def expected_zero_filled_mse(mask: np.ndarray, mean_power: np.ndarray) -> float:
     """Predicted per-pixel zero-filled MSE from a mean frequency-domain power spectrum.
 

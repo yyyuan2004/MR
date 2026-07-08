@@ -49,6 +49,7 @@ mrsim/              library code
   masks.py          baseline mask generators, point- and line-wise (exact budgets)
   greedy.py         greedy selection: A-optimal, PSF-penalized, data-driven,
                     line-wise, wavelet-leakage, reconstruction-in-the-loop
+  subspace.py       subspace / generator-manifold priors (SVD basis, Jacobian basis)
   progress.py       dependency-free progress reporting
   recon.py          measurement simulation; zero-filled, Wiener, wavelet-ISTA reconstruction
   metrics.py        PSNR / SSIM / NRMSE / MSE
@@ -56,7 +57,7 @@ mrsim/              library code
   viz.py            image grids, PSF plots, scatter plots
   unet.py           optional compact U-Net (not used by the default pipeline)
   experiment.py     shared plumbing for the numbered scripts
-scripts/            numbered experiment scripts (01-07), run from repo root
+scripts/            numbered experiment scripts (01-10), run from repo root
 tests/              pytest suite
 docs/               usage, experiment descriptions, reproduction log template
 runs/               experiment outputs (gitignored)

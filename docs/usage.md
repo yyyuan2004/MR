@@ -16,6 +16,9 @@ saves a JSON snapshot of the config it ran with
 | `05_artifact_aware_mask_search.py` | PSF-penalized A-optimal greedy mask (spectrum-weighted sidelobe penalty, hybrid candidate pool); `--beta-sweep` sweeps the penalty weight and reports Jaccard overlap with plain A-opt. |
 | `06_greedy_data_driven_mask.py` | Greedy mask from the empirical mean spectral energy of the train split. |
 | `07_compare_all_masks.py` | Build every mask in `mask.types`, evaluate, summarize, and plot score vs error. |
+| `08_subspace_mask.py` | Fit a linear subspace on the train split, select a mask by subspace A-optimal greedy, reconstruct with the closed-form subspace method, plot the design-criterion trace. |
+| `09_loupe_baseline.py` | Train a learned probabilistic Cartesian line mask jointly with a U-Net (LOUPE-style); binarize to an exact-budget mask saved for script 10. |
+| `10_compare_manifold_vs_learned.py` | Compare subspace A-optimal, sparse diagonal-prior A-optimal, variable density, and the learned mask; test whether the subspace leakage metric predicts measured errors. |
 
 Scripts 02-07 generate the dataset automatically if `runs/<exp>/data/dataset.pt`
 does not exist, so each script is runnable on its own.
@@ -68,6 +71,18 @@ does not exist, so each script is runnable on its own.
 - `recon.wavelet_ista`: iterative soft-thresholding parameters (`threshold`,
   `n_iters`, `wavelet`, `levels`, `final_dc`). Remove the block to skip the
   method.
+- `subspace.d`: dimension of the linear subspace fitted on the train split.
+- `subspace.beta`: sidelobe penalty in the subspace A-optimal greedy
+  (0 = pure A-optimal).
+- `subspace.ridge`: Tikhonov term keeping the design Gram matrix invertible
+  before `d` rows are selected.
+- `subspace.lam`: subspace-reconstruction regularization; `null` defaults to
+  `measurement.noise_std ** 2`.
+- `subspace.generative.steps`, `.lr`: latent-space optimization settings of
+  the generator-manifold reconstruction.
+- `loupe.*`: learned-mask baseline — epochs, batch size, learning rate,
+  sigmoid slopes of the probability map and the relaxed binarization, and
+  U-Net width.
 - `outputs.n_examples`: number of representative examples saved as image grids.
 
 ## Output layout

@@ -106,6 +106,35 @@ spurious is exactly what the per-image columns (`artifact_norm`,
 `no_nullspace_content`) and the `_artifact_field.png` / `_nullspace.png`
 magnitude maps make visible.
 
+## Subspace / manifold priors (scripts 08-10)
+
+The prior can also be a low-dimensional model of the signal class itself,
+abstracted as an N x d basis matrix: a linear subspace (`fit_subspace`, top
+SVD modes of the train split) or the Jacobian of a fixed generator at a
+reference latent point (`generator_jacobian_basis`) — both share one
+selection and reconstruction code path.
+
+- **Design**: `greedy_subspace_aoptimal` minimizes
+  `trace((Phi_Omega^H Phi_Omega + ridge I)^-1)` for `Phi = F B`, one
+  frequency-domain row at a time, with O(dN)-per-step Sherman-Morrison
+  updates; the regularized trace is monotonically non-increasing (tested).
+  `beta > 0` adds the min-max-normalized PSF max-sidelobe penalty.
+- **Reconstruction**: `subspace_recon` solves the prior-constrained least
+  squares in closed form. Its output lies in the span of the basis, *not* in
+  the observed subspace — so this linear method has
+  `recon_nullspace_norm > 0` by construction, unlike zero-filling and Wiener.
+  The imputation is only as faithful as the prior: with a d-dimensional basis
+  capturing a fraction q of signal energy, the model bias floors the error at
+  roughly the un-captured (1 - q) energy. `generative_recon` replaces the
+  closed form with latent-space gradient descent on a generator.
+- **Metric**: `subspace_nullspace_leakage(B, mask)` — the fraction of the
+  basis energy falling on unmeasured locations, the subspace analogue of
+  `aliasing_energy_ratio`. On the default run it ranks all compared masks,
+  including the learned line mask from script 09, in the same order as the
+  measured subspace-reconstruction error (script 10 prints the two rankings
+  and their Spearman correlation; note the sample is small — a handful of
+  masks).
+
 ## Argumentation table
 
 `metrics/summary.csv` is the results table; `metrics/argumentation.csv` is the

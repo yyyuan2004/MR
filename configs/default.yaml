@@ -49,6 +49,23 @@ greedy:
     batch_size: 8
     ista_iters: 6
 
+subspace:
+  d: 32                    # subspace dimension fitted on the train split
+  beta: 0.0                # sidelobe penalty in subspace A-opt (0 = pure A-optimal)
+  ridge: 1.0e-6            # Tikhonov term keeping the design Gram invertible
+  lam: null                # subspace recon regularization; null -> measurement.noise_std ** 2
+  generative:
+    steps: 200
+    lr: 0.05
+
+loupe:
+  epochs: 30
+  batch_size: 8
+  lr: 0.001
+  prob_slope: 5.0          # sigmoid slope mapping logits to probabilities
+  mask_slope: 12.0         # sigmoid slope of the relaxed binarization
+  base_channels: 16
+
 recon:
   ridge_lambda: 0.05       # scalar fallback only (no spectrum available)
   wavelet_ista:
