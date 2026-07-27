@@ -1,16 +1,18 @@
-"""Greedy frequency-domain measurement selection strategies.
+"""Greedy measurement selection strategies.
 
-Point-wise selectors use NumPy throughout; the reconstruction-in-the-loop
-line selector additionally runs the torch-based iterative reconstruction.
+Point-wise and line-wise selectors are NumPy-only. The
+reconstruction-in-the-loop selector needs the torch-based iterative
+reconstruction, so it imports torch and `recon` lazily inside the function
+rather than at module scope. (Note that torch still arrives transitively via
+artifacts -> fft_ops, which hosts the core operators, so this keeps the
+module's direct dependency narrow rather than enabling a torch-free install.)
 """
 
 from __future__ import annotations
 
 import numpy as np
-import torch
 from scipy.ndimage import binary_dilation
 
-from . import recon
 from .artifacts import psf_metrics, subband_energies, subband_spectral_mass
 from .masks import center_indices, fill_lines, mask_from_indices, radius_map, validate_budget
 from .progress import track
@@ -456,6 +458,10 @@ def greedy_lines_recon_in_loop(
     the null space. Candidates mix top empirical-energy columns with random
     draws so the search is not confined to the low-frequency block.
     """
+    import torch
+
+    from . import recon
+
     images = np.asarray(images, dtype=np.float32)
     shape = images.shape[-2:]
     validate_budget(shape, n_samples)

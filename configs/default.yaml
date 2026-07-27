@@ -58,6 +58,17 @@ subspace:
     steps: 200
     lr: 0.05
 
+unet_post:                 # learned post-processor (scripts/12_train_unet.py)
+  mask_type: variable_density   # fixed mask the network is trained under
+  epochs: 60
+  batch_size: 8
+  lr: 0.001
+  base_channels: 16
+
+budget_sweep:
+  # Acceleration factors to sweep; sampling_fraction = 1 / acceleration.
+  accelerations: [4, 8, 12]
+
 loupe:
   epochs: 30
   batch_size: 8

@@ -78,6 +78,20 @@ def fitted_power_law_spectrum(images: torch.Tensor) -> np.ndarray:
     return np.maximum(spectrum, 1e-12)
 
 
+def load_unet(run: Path):
+    """Load the trained U-Net post-processor if scripts/12 has produced one."""
+    path = run / "models" / "unet_post.pt"
+    if not path.exists():
+        return None
+    from .unet import SmallUNet
+
+    payload = torch.load(path, map_location="cpu", weights_only=False)
+    model = SmallUNet(base_channels=int(payload.get("base_channels", 16)))
+    model.load_state_dict(payload["state_dict"])
+    model.eval()
+    return model
+
+
 def fit_train_subspace(
     cfg: dict[str, Any], train_images: torch.Tensor
 ) -> tuple[np.ndarray, float]:
@@ -220,6 +234,134 @@ def build_masks(
     return out
 
 
+def build_mask_family(
+    cfg: dict[str, Any], train_images: torch.Tensor
+) -> dict[str, np.ndarray]:
+    """Parameterized family of masks spanning each generator's free parameters.
+
+    Correlating a design-time predictor against measured error over a handful
+    of masks has almost no statistical power. This sweeps the parameters that
+    actually vary within each family (density decay, level structure, penalty
+    weight, random seed) to give the rank correlations a usable sample size.
+    Every variant obeys the same budget and center rules as the named masks;
+    each random variant gets its own seeded generator so adding a variant
+    never perturbs the others.
+    """
+    shape, n_samples, n_center = mask_budgets(cfg)
+    noise_var = greedy_noise_var(cfg)
+    mask_cfg = cfg.get("mask", {})
+    fam = mask_cfg.get("family", {})
+    lines_cfg = mask_cfg.get("lines", {})
+    n_center_lines = int(lines_cfg.get("n_center_lines", 2))
+    ista_cfg = cfg.get("recon", {}).get("wavelet_ista", {})
+    wavelet = str(ista_cfg.get("wavelet", "db4"))
+    levels = int(ista_cfg.get("levels", 3))
+    n_candidates = int(cfg.get("greedy", {}).get("n_candidates", 32))
+    sub_cfg = cfg.get("subspace", {})
+
+    seeds = [int(s) for s in fam.get("seeds", [0, 1, 2])]
+    vd_decays = [float(x) for x in fam.get("variable_density_decay", [1.5, 2.5, 3.5, 5.0])]
+    vdl_decays = [float(x) for x in fam.get("variable_density_lines_decay", [1.0, 2.0, 4.0])]
+    betas = [float(x) for x in fam.get("psf_penalized_beta", [0.5, 1.0, 2.0, 4.0])]
+    sub_betas = [float(x) for x in fam.get("subspace_beta", [0.0, 1.0])]
+    ml_specs = fam.get(
+        "multilevel",
+        [
+            {"n_levels": 3, "decay": 1.0},
+            {"n_levels": 3, "decay": 2.0},
+            {"n_levels": 4, "decay": 1.0},
+            {"n_levels": 4, "decay": 1.5},
+            {"n_levels": 4, "decay": 2.5},
+            {"n_levels": 5, "decay": 1.5},
+        ],
+    )
+
+    cache: dict[str, Any] = {}
+
+    def prior() -> np.ndarray:
+        if "prior" not in cache:
+            cache["prior"] = fitted_power_law_spectrum(train_images)
+        return cache["prior"]
+
+    def kspace_basis() -> np.ndarray:
+        if "phi" not in cache:
+            basis, _ = fit_train_subspace(cfg, train_images)
+            cache["phi"] = subspace.to_kspace_basis(basis, shape)
+        return cache["phi"]
+
+    specs: list[tuple[str, Callable[[], np.ndarray]]] = []
+
+    for seed in seeds:
+        specs.append(
+            (f"uniform_random_s{seed}",
+             lambda s=seed: masks.uniform_random_mask(
+                 shape, n_samples, np.random.default_rng(s), n_center))
+        )
+    for decay in vd_decays:
+        for seed in seeds[:2]:
+            specs.append(
+                (f"variable_density_d{decay:g}_s{seed}",
+                 lambda d=decay, s=seed: masks.variable_density_mask(
+                     shape, n_samples, np.random.default_rng(s), decay=d, n_center=n_center))
+            )
+    for spec in ml_specs:
+        n_levels, decay = int(spec["n_levels"]), float(spec["decay"])
+        specs.append(
+            (f"multilevel_L{n_levels}_d{decay:g}",
+             lambda L=n_levels, d=decay: masks.multilevel_random_mask(
+                 shape, n_samples, np.random.default_rng(seeds[0]), n_levels=L, decay=d))
+        )
+    specs.append(("equispaced_lines", lambda: masks.equispaced_lines_mask(shape, n_samples)))
+    for decay in vdl_decays:
+        specs.append(
+            (f"variable_density_lines_d{decay:g}",
+             lambda d=decay: masks.variable_density_lines_mask(
+                 shape, n_samples, np.random.default_rng(seeds[0]),
+                 decay=d, n_center_lines=n_center_lines))
+        )
+    specs.append(
+        ("aopt_greedy",
+         lambda: greedy.greedy_a_optimal(prior(), n_samples, noise_var=noise_var, n_center=n_center))
+    )
+    for beta in betas:
+        specs.append(
+            (f"psf_penalized_b{beta:g}",
+             lambda b=beta: greedy.greedy_psf_penalized_aopt(
+                 prior(), n_samples, noise_var=noise_var, beta=b,
+                 n_candidates=n_candidates, n_center=n_center,
+                 rng=np.random.default_rng(seeds[0])))
+        )
+    specs.append(
+        ("line_aopt",
+         lambda: greedy.greedy_line_a_optimal(
+             prior(), n_samples, noise_var=noise_var, n_center_lines=n_center_lines))
+    )
+    specs.append(
+        ("spectrum_energy_greedy",
+         lambda: greedy.greedy_lines_spectrum_energy(
+             train_images.numpy(), n_samples, n_center_lines=n_center_lines))
+    )
+    specs.append(
+        ("line_subspace_leakage",
+         lambda: greedy.greedy_lines_subspace_leakage(
+             train_images.numpy(), n_samples,
+             wavelet=wavelet, levels=levels, n_center_lines=n_center_lines))
+    )
+    for beta in sub_betas:
+        specs.append(
+            (f"subspace_aopt_b{beta:g}",
+             lambda b=beta: greedy.greedy_subspace_aoptimal(
+                 kspace_basis(), n_samples, sigma2=noise_var, n_center=n_center,
+                 beta=b, shape=shape, ridge=float(sub_cfg.get("ridge", 1e-6)),
+                 n_candidates=n_candidates))
+        )
+
+    out: dict[str, np.ndarray] = {}
+    for name, builder in track(specs, total=len(specs), label="build family"):
+        out[name] = builder()
+    return out
+
+
 def save_mask_bundle(mask: np.ndarray, name: str, run: Path) -> dict[str, float]:
     """Save mask array, mask image, and PSF plot; return PSF metrics row."""
     _ensure_dir(run / "masks")
@@ -249,6 +391,7 @@ def reconstruct_all(
     subspace_basis: np.ndarray | None = None,
     gen_model=None,
     gen_z0: torch.Tensor | None = None,
+    unet_model=None,
 ) -> dict[str, torch.Tensor]:
     """Simulate measurements and reconstruct with every configured method.
 
@@ -269,6 +412,13 @@ def reconstruct_all(
     construction (recon_nullspace_norm > 0 — intentional; see
     recon.subspace_recon). With gen_model and gen_z0, the "generative" method
     optimizes the latent code of a fixed generator per image.
+
+    With unet_model (trained by scripts/12_train_unet.py on training data
+    only), the "unet_post" method post-processes the zero-filled magnitude.
+    It is a learned prior arm: it imputes null-space content, and — unlike
+    wavelet_ista with final_dc — it enforces no data consistency, so its
+    consistency_norm is expected to be nonzero. That is a reported property
+    of the method, not a defect.
     """
     noise_std = float(cfg.get("measurement", {}).get("noise_std", 0.0))
     y = recon.simulate_measurements(images, mask, noise_std=noise_std, generator=generator)
@@ -295,6 +445,12 @@ def reconstruct_all(
             levels=int(ista_cfg.get("levels", 3)),
             final_dc=bool(ista_cfg.get("final_dc", True)),
         )
+
+    if unet_model is not None:
+        unet_model.eval()
+        with torch.no_grad():
+            zf_magnitude = out["zero_filled"].abs().unsqueeze(1)
+            out["unet_post"] = unet_model(zf_magnitude).squeeze(1).to(torch.complex64)
 
     sub_cfg = cfg.get("subspace", {})
     if subspace_basis is not None:
@@ -401,6 +557,8 @@ def evaluate_masks(
     example_indices: list[int] | None = None,
     spectrum: np.ndarray | None = None,
     subspace_basis: np.ndarray | None = None,
+    unet_model=None,
+    write_examples: bool = True,
 ) -> pd.DataFrame:
     """Full evaluation of a set of masks: metrics CSV, examples, PSF metrics.
 
@@ -419,20 +577,96 @@ def evaluate_masks(
         recons = reconstruct_all(
             test_images, mask, cfg,
             generator=generator, spectrum=spectrum, subspace_basis=subspace_basis,
+            unet_model=unet_model,
         )
         recons_by_mask[name] = recons
         all_rows.extend(metrics_rows(recons, test_images, mask, name))
 
     frame = pd.DataFrame(all_rows)
-    if example_indices is None:
-        example_indices = representative_indices(frame, n_examples, test_images.shape[0])
-    for name, mask in mask_dict.items():
-        save_examples(test_images, recons_by_mask[name], mask, name, run, example_indices)
+    # Each mask/method pair costs three rendered grids; a parameter sweep over
+    # dozens of masks spends more time in matplotlib than in reconstruction.
+    if write_examples:
+        if example_indices is None:
+            example_indices = representative_indices(frame, n_examples, test_images.shape[0])
+        for name, mask in mask_dict.items():
+            save_examples(test_images, recons_by_mask[name], mask, name, run, example_indices)
 
     _ensure_dir(run / "metrics")
     frame.to_csv(run / "metrics" / f"{prefix}_metrics.csv", index=False)
     pd.DataFrame(psf_rows).to_csv(run / "metrics" / f"{prefix}_psf_metrics.csv", index=False)
     return frame
+
+
+def argumentation_table(
+    mask_dict: dict[str, np.ndarray],
+    frame: pd.DataFrame,
+    train_power: np.ndarray,
+    mass: dict[str, np.ndarray] | None = None,
+    energies: dict[str, float] | None = None,
+    basis: np.ndarray | None = None,
+    baseline_method: str = "zero_filled",
+) -> pd.DataFrame:
+    """Design-time predictors next to measured outcomes, one row per mask.
+
+    The point is argumentative rather than descriptive: every predictor claims
+    to rank masks before any measurement is simulated, and the outcome columns
+    test that claim. Per-method mean MSE columns (mse_<method>) and PSNR gains
+    over the baseline method (psnr_gain_<method>) are emitted for whichever
+    methods are present in `frame`, so learned and iterative arms join the
+    correlation test automatically.
+    """
+    rows = []
+    for name, mask in mask_dict.items():
+        sub = frame[frame["mask"] == name]
+        base = sub[sub["method"] == baseline_method]
+        row: dict[str, Any] = {"mask": name}
+        row["mask_score"] = artifacts.expected_zero_filled_mse(mask, train_power)
+        row.update(artifacts.psf_metrics(mask))
+        row.update(artifacts.spectrum_weighted_psf_metrics(mask, train_power))
+        if mass is not None and energies is not None:
+            row["wavelet_leakage"] = artifacts.wavelet_leakage_score(mask, mass, energies)
+        if basis is not None:
+            row["subspace_leakage"] = artifacts.subspace_nullspace_leakage(basis, mask)
+        row["truth_nullspace_norm"] = float(base["truth_nullspace_norm"].mean())
+        for method in sorted(sub["method"].unique()):
+            block = sub[sub["method"] == method]
+            row[f"mse_{method}"] = float(block["mse"].mean())
+            row[f"nullspace_{method}"] = float(block["recon_nullspace_norm"].mean())
+            row[f"consistency_{method}"] = float(block["consistency_norm"].mean())
+            if method != baseline_method:
+                row[f"psnr_gain_{method}"] = float(
+                    block["psnr"].mean() - base["psnr"].mean()
+                )
+        rows.append(row)
+    return pd.DataFrame(rows)
+
+
+def rank_correlations(
+    table: pd.DataFrame, predictors: list[str], outcomes: list[str]
+) -> pd.DataFrame:
+    """Spearman rank correlation of each predictor against each outcome."""
+    from scipy.stats import spearmanr
+
+    rows = []
+    for predictor in predictors:
+        if predictor not in table:
+            continue
+        for outcome in outcomes:
+            if outcome not in table or table[outcome].isna().all():
+                continue
+            if table[predictor].nunique() < 2 or table[outcome].nunique() < 2:
+                continue
+            rho, p_value = spearmanr(table[predictor], table[outcome])
+            rows.append(
+                {
+                    "predictor": predictor,
+                    "outcome": outcome,
+                    "n_masks": int(len(table)),
+                    "spearman_rho": float(rho),
+                    "p_value": float(p_value),
+                }
+            )
+    return pd.DataFrame(rows)
 
 
 def representative_indices(frame: pd.DataFrame, n_examples: int, n_test: int) -> list[int]:

@@ -127,6 +127,14 @@ selection and reconstruction code path.
   capturing a fraction q of signal energy, the model bias floors the error at
   roughly the un-captured (1 - q) energy. `generative_recon` replaces the
   closed form with latent-space gradient descent on a generator.
+- **Learned arm**: `scripts/12_train_unet.py` trains a U-Net post-processor on
+  zero-filled magnitudes (training split only) and registers it as
+  `unet_post`. It imputes null-space content like the other priors, but it
+  enforces no data consistency — there is no analogue of ISTA's `final_dc`
+  step — so its `consistency_norm` is substantially nonzero (on the default
+  run, ~4.6x the zero-filled baseline, which only carries measurement noise).
+  That is a reported property of post-processing, not a defect, and it is
+  precisely the kind of distinction the decomposition exists to expose.
 - **Metric**: `subspace_nullspace_leakage(B, mask)` — the fraction of the
   basis energy falling on unmeasured locations, the subspace analogue of
   `aliasing_energy_ratio`. On the default run it ranks all compared masks,
@@ -134,6 +142,53 @@ selection and reconstruction code path.
   measured subspace-reconstruction error (script 10 prints the two rankings
   and their Spearman correlation; note the sample is small — a handful of
   masks).
+
+## Measurement operators
+
+The decomposition never uses the Fourier transform directly — it only needs
+the orthogonal projector `P = A^H A` onto the observed subspace. `operators.py`
+makes the operator pluggable and ships two:
+
+- `FourierOperator` (default, `A = M F`): the mask indexes frequencies.
+- `InpaintingOperator` (`A = M`): the mask indexes signal samples, so `P` is
+  already diagonal in the signal domain and the null space is literally the
+  unmeasured pixels.
+
+`decompose_error(..., operator=...)` accepts either; every identity
+(complementarity, the Pythagorean split, Hermitian idempotent `P`) is tested
+for both. The point is that "whether a prior helps is governed by null-space
+structure" is a statement about the operator's null space, not about Fourier
+sampling.
+
+## Budget sweep and the phase diagram
+
+At 4x acceleration the entire low-frequency block fits inside the budget, so
+essentially every sensible design takes the same energy-dense core and
+sampling design barely matters. The capture-energy / control-coherence
+trade-off only becomes real once the budget cannot hold that core, which is
+what 8x and 12x probe. `scripts/11_budget_sweep.py` sweeps the acceleration
+factor over the full parameterized mask family and concatenates the per-budget
+argumentation tables into `metrics/budget_sweep.csv`, printing three decisive
+numbers per budget: whether the PSF penalty has separated from plain
+A-optimal (Jaccard), whether the spectral energy score still predicts the
+nonlinear error, and whether any null-space norm predicts the prior's payoff.
+
+`scripts/13_phase_diagram.py` renders that table as the summary figure:
+acceleration on x, mask coherence on y, and the prior's PSNR gain as a
+diverging color scale whose neutral midpoint is pinned exactly at zero, with
+the zero level drawn as an explicit contour. The contour is the boundary
+between "the prior helps" and "the prior hurts".
+
+## Statistical power
+
+Rank correlations over a handful of masks are not evidence. The default
+comparison in script 07 uses 11 masks, which is enough to see a strong effect
+(`mask_score` vs zero-filled MSE) but far too few to call a weak one
+significant — an observed rho near 0.4 at n = 11 has p ≈ 0.2 and supports no
+conclusion. `experiment.build_mask_family` therefore sweeps each generator's
+free parameters (density decay, level structure, penalty weight, random seed)
+to produce ~31 masks by default, and every correlation row records `n_masks`
+alongside rho and p. Widen `mask.family.*` to push n further.
 
 ## Argumentation table
 
