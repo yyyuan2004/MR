@@ -14,7 +14,14 @@ import numpy as np
 from scipy.ndimage import binary_dilation
 
 from .artifacts import psf_metrics, subband_energies, subband_spectral_mass
-from .masks import center_indices, fill_lines, mask_from_indices, radius_map, validate_budget
+from .masks import (
+    center_indices,
+    fill_lines,
+    line_count_from_sample_budget,
+    mask_from_indices,
+    radius_map,
+    validate_budget,
+)
 from .progress import track
 
 
@@ -31,9 +38,28 @@ def _aopt_gain(spectrum: np.ndarray, noise_var: float) -> np.ndarray:
     sigma^2, the posterior MSE of the Wiener estimator after sampling set S is
         sum_{k not in S} s_k + sum_{k in S} s_k sigma^2 / (s_k + sigma^2),
     so adding location k reduces the expected MSE by s_k^2 / (s_k + sigma^2).
+
+    The gain is monotone in ``s_k`` for every fixed non-negative noise
+    variance.  Noise changes gain magnitudes but not the point-wise ordering.
+    The division below defines the removable ``0 / 0`` case at
+    ``s_k = sigma^2 = 0`` to have zero gain.
     """
     s = np.asarray(spectrum, dtype=np.float64).ravel()
-    return s**2 / (s + noise_var)
+    if not np.isfinite(noise_var) or noise_var < 0.0:
+        raise ValueError("noise_var must be finite and non-negative")
+    if not np.all(np.isfinite(s)):
+        raise ValueError("spectrum must contain only finite values")
+    if np.any(s < 0.0):
+        raise ValueError("spectrum must be non-negative")
+
+    denominator = s + noise_var
+    shrinkage = np.divide(
+        s,
+        denominator,
+        out=np.zeros_like(s),
+        where=denominator > 0.0,
+    )
+    return s * shrinkage
 
 
 def greedy_a_optimal(
@@ -42,16 +68,28 @@ def greedy_a_optimal(
     noise_var: float = 1e-3,
     n_center: int = 0,
 ) -> np.ndarray:
-    """Greedy Bayesian A-optimal selection with a diagonal frequency-domain prior."""
-    shape = spectrum.shape
+    """Stable top-k A-optimal selection for a diagonal Fourier-domain prior.
+
+    The historical function name is retained for compatibility.  Because
+    ``s_k^2 / (s_k + sigma^2)`` is monotone in ``s_k``, point-wise diagonal
+    A-optimal design is exactly a top-k spectrum ranking: ``noise_var`` never
+    changes the selected locations.  A stable descending sort gives
+    deterministic flat-index tie breaking, including an all-zero spectrum.
+    """
+    spectrum_array = np.asarray(spectrum, dtype=np.float64)
+    if spectrum_array.ndim != 2:
+        raise ValueError("spectrum must be a two-dimensional array")
+    shape = spectrum_array.shape
     validate_budget(shape, n_samples, n_center)
-    gain = _aopt_gain(spectrum, noise_var)
+    # Validate both the prior and noise model, while selecting from the
+    # spectrum itself to avoid underflow-induced ties in tiny A-opt gains.
+    _aopt_gain(spectrum_array, noise_var)
+    flat_spectrum = spectrum_array.ravel()
     selected = _preselect_center(shape, n_center)
-    n_selected = int(selected.sum())
-    while n_selected < n_samples:
-        best = int(np.argmax(np.where(selected, -np.inf, gain)))
-        selected[best] = True
-        n_selected += 1
+    order = np.argsort(-flat_spectrum, kind="stable")
+    free_order = order[~selected[order]]
+    n_needed = n_samples - int(selected.sum())
+    selected[free_order[:n_needed]] = True
     return mask_from_indices(shape, np.flatnonzero(selected))
 
 
@@ -93,7 +131,7 @@ def _sidelobe_reduction_candidates(
     a, b = np.meshgrid(ky, kx, indexing="ij")
     # Exact plane-wave value of the centered orthonormal inverse FFT of a
     # delta at centered frequency (a, b), evaluated at centered lag (u, v).
-    phase = 2.0 * np.pi * (a * u / n_rows + b * v / n_cols) + np.pi * (a + b)
+    phase = 2.0 * np.pi * (a * u / n_rows + b * v / n_cols)
     contribution = (weight / np.sqrt(mask.size)) * np.exp(1j * phase)
     reduction = -np.real(np.conj(psf[ty, tx]) * contribution).ravel()
     reduction[selected] = -np.inf
@@ -178,7 +216,7 @@ def greedy_psf_penalized_aopt(
     gain = _aopt_gain(spectrum, noise_var)
     weight = np.asarray(spectrum, dtype=np.float64) if weighted else np.ones(shape)
     weight = weight / weight.max()
-    selected = _preselect_center(shape, max(n_center, 1))
+    selected = _preselect_center(shape, n_center)
     mask = mask_from_indices(shape, np.flatnonzero(selected))
     n_selected = int(selected.sum())
 
@@ -269,14 +307,17 @@ def greedy_subspace_aoptimal(
     ridge: float = 1e-6,
     n_candidates: int = 32,
     return_trace: bool = False,
+    prior_variances: np.ndarray | None = None,
 ) -> np.ndarray | tuple[np.ndarray, list[float]]:
     """Greedy A-optimal selection under a subspace/manifold prior.
 
-    Model: y_Omega = Phi_Omega alpha + eps with Phi = F B the frequency-domain
-    basis (N x d). The Fisher information is J = Phi_Omega^H Phi_Omega /
-    sigma^2; each step adds the frequency-domain row maximizing the reduction
-    of trace((Phi_Omega^H Phi_Omega + ridge I)^-1), computed for every
-    candidate at O(d N) per step via the Sherman-Morrison rank-one update
+    Model: ``alpha ~ N(0, Lambda)`` and
+    ``y_Omega = Phi_Omega alpha + eps`` with ``Phi = F B``. Each step adds the
+    row maximizing the reduction of
+    ``trace((Phi_Omega^H Phi_Omega + ridge Lambda^-1)^-1)``. With
+    ``prior_variances=None``, ``Lambda=I`` preserves the historical isotropic
+    model. The reductions are computed for every candidate at O(d N) per step
+    via the Sherman-Morrison rank-one update
         delta(k) = ||A_inv v_k||^2 / (1 + v_k^H A_inv v_k),  v_k = conj(Phi[k]).
     The ridge keeps the matrix invertible before d rows are selected; adding a
     positive-semidefinite rank-one term can only decrease the regularized
@@ -302,10 +343,25 @@ def greedy_subspace_aoptimal(
     if shape[0] * shape[1] != n_locations:
         raise ValueError("shape does not match the basis row count")
     validate_budget(shape, n_samples, n_center)
+    if not np.isfinite(sigma2) or sigma2 < 0.0:
+        raise ValueError("sigma2 must be finite and non-negative")
+    if not np.isfinite(ridge) or ridge <= 0.0:
+        raise ValueError("ridge must be finite and positive")
+    if prior_variances is None:
+        variances = np.ones(d, dtype=np.float64)
+    else:
+        variances = np.asarray(prior_variances, dtype=np.float64)
+        if variances.shape != (d,):
+            raise ValueError(f"prior_variances must have shape ({d},)")
+        if not np.isfinite(variances).all() or np.any(variances < 0.0):
+            raise ValueError(
+                "prior_variances must contain finite, non-negative values"
+            )
+        variances = np.maximum(variances, 1e-12)
 
     selected = _preselect_center(shape, n_center)
     chosen = np.flatnonzero(selected)
-    gram = ridge * np.eye(d) + phi[chosen].conj().T @ phi[chosen]
+    gram = ridge * np.diag(1.0 / variances) + phi[chosen].conj().T @ phi[chosen]
     a_inv = np.linalg.inv(gram)
     # Column k of `scores_mat` is A_inv v_k for every candidate row at once.
     scores_mat = a_inv @ phi.conj().T
@@ -371,17 +427,18 @@ def _lines_by_gain(
     n_samples: int,
     n_center_lines: int,
 ) -> np.ndarray:
-    """Column mask from a per-column gain: forced center lines, then greedy."""
-    validate_budget(shape, n_samples)
-    n_rows, n_cols = shape
-    needed = int(np.ceil(n_samples / n_rows))
-    n_center_lines = min(n_center_lines, needed)
+    """Full-column mask from a point budget: forced center, then top gain."""
+    n_cols = shape[1]
+    n_lines = line_count_from_sample_budget(shape, n_samples)
+    if n_center_lines < 0:
+        raise ValueError("n_center_lines must be non-negative")
+    n_center_lines = min(n_center_lines, n_lines)
 
     offsets = np.abs(np.arange(n_cols) - n_cols // 2)
     center_cols = np.argsort(offsets, kind="stable")[:n_center_lines].astype(np.int64)
     gain = np.asarray(column_gain, dtype=np.float64).copy()
     gain[center_cols] = -np.inf
-    rest = np.argsort(gain, kind="stable")[::-1][: needed - n_center_lines]
+    rest = np.argsort(-gain, kind="stable")[: n_lines - n_center_lines]
     return fill_lines(shape, np.concatenate([center_cols, rest]), n_samples)
 
 
@@ -464,12 +521,13 @@ def greedy_lines_recon_in_loop(
 
     images = np.asarray(images, dtype=np.float32)
     shape = images.shape[-2:]
-    validate_budget(shape, n_samples)
     rng = rng if rng is not None else np.random.default_rng(0)
 
-    n_rows, n_cols = shape
-    needed = int(np.ceil(n_samples / n_rows))
-    n_center_lines = min(n_center_lines, needed)
+    n_cols = shape[1]
+    n_lines = line_count_from_sample_budget(shape, n_samples)
+    if n_center_lines < 0:
+        raise ValueError("n_center_lines must be non-negative")
+    n_center_lines = min(n_center_lines, n_lines)
     offsets = np.abs(np.arange(n_cols) - n_cols // 2)
     chosen = list(np.argsort(offsets, kind="stable")[:n_center_lines].astype(int))
 
@@ -487,9 +545,9 @@ def greedy_lines_recon_in_loop(
         )
         return float(((x.abs() - batch) ** 2).mean())
 
-    steps: range | object = range(needed - len(chosen))
+    steps: range | object = range(n_lines - len(chosen))
     if show_progress:
-        steps = track(steps, total=needed - len(chosen), label="recon_in_loop")
+        steps = track(steps, total=n_lines - len(chosen), label="recon_in_loop")
     for _ in steps:
         free = np.setdiff1d(np.arange(n_cols), np.asarray(chosen, dtype=np.int64))
         half = max(1, n_candidate_lines // 2)

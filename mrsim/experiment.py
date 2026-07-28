@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+import hashlib
+import json
 import time
 import warnings
 from pathlib import Path
@@ -12,6 +14,7 @@ import pandas as pd
 import torch
 
 from . import artifacts, data, greedy, masks, metrics, recon, subspace, viz
+from .config import config_fingerprint
 from .fft_ops import fft2c
 from .progress import track
 
@@ -24,11 +27,34 @@ def dataset_path(run: Path) -> Path:
     return run / "data" / "dataset.pt"
 
 
+def _dataset_metadata(cfg: dict[str, Any]) -> dict[str, Any]:
+    d = cfg["data"]
+    return {
+        "seed": int(cfg["seed"]),
+        "n_images": int(d["n_images"]),
+        "image_size": int(d["image_size"]),
+        "phantom": str(d.get("phantom", "ellipses")),
+        "min_ellipses": int(d.get("min_ellipses", 3)),
+        "max_ellipses": int(d.get("max_ellipses", 8)),
+    }
+
+
 def load_or_generate_dataset(cfg: dict[str, Any], run: Path, force: bool = False) -> torch.Tensor:
-    """Load the run's dataset, generating and saving it if needed."""
+    """Load the run's dataset, rejecting stale or incompatible cache entries."""
     path = dataset_path(run)
+    expected_metadata = _dataset_metadata(cfg)
     if path.exists() and not force:
-        return torch.load(path)
+        payload = torch.load(path, map_location="cpu", weights_only=True)
+        if not isinstance(payload, dict) or "images" not in payload or "metadata" not in payload:
+            raise ValueError(
+                f"{path} is a legacy dataset cache without metadata; regenerate it with script 01"
+            )
+        if payload["metadata"] != expected_metadata:
+            raise ValueError(
+                f"{path} was generated from a different data configuration; "
+                "use the matching config-hash run or regenerate it"
+            )
+        return payload["images"]
     d = cfg["data"]
     images = data.generate_dataset(
         n_images=int(d["n_images"]),
@@ -39,17 +65,33 @@ def load_or_generate_dataset(cfg: dict[str, Any], run: Path, force: bool = False
         max_ellipses=int(d.get("max_ellipses", 8)),
     )
     path.parent.mkdir(parents=True, exist_ok=True)
-    torch.save(images, path)
+    torch.save({"images": images, "metadata": expected_metadata}, path)
     return images
 
 
-def train_test_split(images: torch.Tensor, cfg: dict[str, Any]) -> tuple[torch.Tensor, torch.Tensor]:
-    """Deterministic split: first n_train images train, next n_test images test."""
+def train_validation_test_split(
+    images: torch.Tensor, cfg: dict[str, Any]
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    """Deterministic, disjoint train/validation/test split."""
     d = cfg["data"]
-    n_train, n_test = int(d["n_train"]), int(d["n_test"])
-    if n_train + n_test > images.shape[0]:
-        raise ValueError("n_train + n_test exceeds the dataset size")
-    return images[:n_train], images[n_train : n_train + n_test]
+    n_train = int(d["n_train"])
+    n_val = int(d.get("n_val", 0))
+    n_test = int(d["n_test"])
+    if n_train + n_val + n_test > images.shape[0]:
+        raise ValueError("n_train + n_val + n_test exceeds the dataset size")
+    val_start = n_train
+    test_start = n_train + n_val
+    return (
+        images[:n_train],
+        images[val_start:test_start],
+        images[test_start : test_start + n_test],
+    )
+
+
+def train_test_split(images: torch.Tensor, cfg: dict[str, Any]) -> tuple[torch.Tensor, torch.Tensor]:
+    """Compatibility wrapper returning train and the held-out test split."""
+    train, _, test = train_validation_test_split(images, cfg)
+    return train, test
 
 
 # ---------------------------------------------------------------------------
@@ -57,19 +99,34 @@ def train_test_split(images: torch.Tensor, cfg: dict[str, Any]) -> tuple[torch.T
 # ---------------------------------------------------------------------------
 
 def mean_power_spectrum(images: torch.Tensor) -> np.ndarray:
-    """Mean centered frequency-domain power |X_k|^2 over a stack of images."""
+    """Second moment E|X_k|^2 over a stack of images."""
     k = fft2c(images.to(torch.complex64))
-    return (k.abs() ** 2).mean(dim=0).numpy().astype(np.float64)
+    return (k.abs() ** 2).mean(dim=0).detach().cpu().numpy().astype(np.float64)
+
+
+def frequency_prior_statistics(
+    images: torch.Tensor,
+) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
+    """Return complex mean, centered variance, and second moment in k-space."""
+    k = fft2c(images.to(torch.complex64))
+    mean = k.mean(dim=0)
+    variance = ((k - mean).abs() ** 2).mean(dim=0)
+    second_moment = (k.abs() ** 2).mean(dim=0)
+    return (
+        mean.detach().cpu().numpy().astype(np.complex64),
+        variance.detach().cpu().numpy().astype(np.float64),
+        second_moment.detach().cpu().numpy().astype(np.float64),
+    )
 
 
 def fitted_power_law_spectrum(images: torch.Tensor) -> np.ndarray:
-    """Radially symmetric power-law fit to the empirical mean spectrum.
+    """Radially symmetric power-law fit to the centered spectral variance.
 
     Fits log s = intercept + slope * log(1 + r) by least squares and rebuilds
     a smooth spectrum from the radius map. Used as the model prior for
     A-optimal and artifact-aware greedy selection.
     """
-    empirical = mean_power_spectrum(images)
+    _, empirical, _ = frequency_prior_statistics(images)
     r = masks.radius_map(empirical.shape)
     x = np.log1p(r).ravel()
     y = np.log(empirical.ravel() + 1e-12)
@@ -78,14 +135,30 @@ def fitted_power_law_spectrum(images: torch.Tensor) -> np.ndarray:
     return np.maximum(spectrum, 1e-12)
 
 
-def load_unet(run: Path):
-    """Load the trained U-Net post-processor if scripts/12 has produced one."""
+def load_unet(run: Path, cfg: dict[str, Any] | None = None):
+    """Load a compatible experimental U-Net checkpoint, when present."""
     path = run / "models" / "unet_post.pt"
     if not path.exists():
         return None
     from .unet import SmallUNet
 
-    payload = torch.load(path, map_location="cpu", weights_only=False)
+    payload = torch.load(path, map_location="cpu", weights_only=True)
+    if cfg is not None:
+        expected_size = [int(cfg["data"]["image_size"])] * 2
+        if payload.get("image_size") != expected_size:
+            warnings.warn(
+                f"ignoring {path}: checkpoint image size "
+                f"{payload.get('image_size')} != {expected_size}",
+                stacklevel=2,
+            )
+            return None
+        expected_fingerprint = config_fingerprint(cfg)
+        if payload.get("config_fingerprint") != expected_fingerprint:
+            warnings.warn(
+                f"ignoring {path}: checkpoint was trained under another config",
+                stacklevel=2,
+            )
+            return None
     model = SmallUNet(base_channels=int(payload.get("base_channels", 16)))
     model.load_state_dict(payload["state_dict"])
     model.eval()
@@ -95,9 +168,25 @@ def load_unet(run: Path):
 def fit_train_subspace(
     cfg: dict[str, Any], train_images: torch.Tensor
 ) -> tuple[np.ndarray, float]:
-    """Fit the config-sized subspace basis on the train split."""
+    """Fit a centered config-sized subspace basis on the train split."""
+    statistics = fit_train_subspace_statistics(cfg, train_images)
+    return statistics.basis, statistics.energy_ratio
+
+
+def fit_train_subspace_statistics(
+    cfg: dict[str, Any], train_images: torch.Tensor
+) -> subspace.SubspaceStatistics:
+    """Fit the empirical mean and covariance subspace on training data."""
     d = int(cfg.get("subspace", {}).get("d", 32))
-    return subspace.fit_subspace(train_images, d)
+    statistics = subspace.fit_subspace(
+        train_images,
+        d,
+        center=True,
+        return_statistics=True,
+    )
+    if not isinstance(statistics, subspace.SubspaceStatistics):
+        raise TypeError("centered subspace fit did not return statistics")
+    return statistics
 
 
 def greedy_noise_var(cfg: dict[str, Any]) -> float:
@@ -113,6 +202,22 @@ def greedy_noise_var(cfg: dict[str, Any]) -> float:
     return float(cfg.get("measurement", {}).get("noise_std", 0.0)) ** 2
 
 
+def subspace_regularization(cfg: dict[str, Any]) -> float:
+    """Noise-matched affine-Gaussian regularization with a numerical floor."""
+    sub_cfg = cfg.get("subspace", {})
+    floor = float(sub_cfg.get("ridge", 1e-8))
+    configured = sub_cfg.get("lam")
+    measurement_variance = float(
+        cfg.get("measurement", {}).get("noise_std", 0.0)
+    ) ** 2
+    value = measurement_variance if configured is None else float(configured)
+    if not np.isfinite(floor) or floor <= 0.0:
+        raise ValueError("subspace.ridge must be finite and positive")
+    if not np.isfinite(value) or value < 0.0:
+        raise ValueError("subspace.lam must be finite and non-negative")
+    return max(value, floor)
+
+
 def mask_budgets(cfg: dict[str, Any]) -> tuple[tuple[int, int], int, int]:
     """Return (shape, n_samples, n_center) from the config."""
     size = int(cfg["data"]["image_size"])
@@ -122,16 +227,35 @@ def mask_budgets(cfg: dict[str, Any]) -> tuple[tuple[int, int], int, int]:
     return shape, n_samples, min(n_center, n_samples)
 
 
+def _named_rng(seed: int, *parts: str) -> np.random.Generator:
+    """Order-independent RNG derived from a global seed and stable names."""
+    payload = "\0".join((str(seed), *parts)).encode("utf-8")
+    digest = hashlib.sha256(payload).digest()
+    child_seed = int.from_bytes(digest[:8], "little", signed=False)
+    return np.random.default_rng(child_seed)
+
+
+def _to_numpy(images: torch.Tensor) -> np.ndarray:
+    """Detach a tensor for NumPy-only design routines."""
+    return images.detach().cpu().numpy()
+
+
 def build_masks(
     names: list[str],
     cfg: dict[str, Any],
     train_images: torch.Tensor,
     rng: np.random.Generator,
 ) -> dict[str, np.ndarray]:
-    """Build the requested masks by name, sharing one budget and prior."""
+    """Build requested masks with order-independent per-mask randomness.
+
+    ``rng`` remains in the public signature for compatibility. Random mask
+    streams are intentionally derived from the config seed and mask name so
+    adding or reordering another mask cannot perturb existing results.
+    """
     shape, n_samples, n_center = mask_budgets(cfg)
     g = cfg.get("greedy", {})
     noise_var = greedy_noise_var(cfg)
+    seed = int(cfg["seed"])
 
     mask_cfg = cfg.get("mask", {})
     lines_cfg = mask_cfg.get("lines", {})
@@ -150,28 +274,32 @@ def build_masks(
             beta=beta,
             n_candidates=int(g.get("n_candidates", 32)),
             n_center=n_center,
-            rng=rng,
+            rng=_named_rng(seed, "mask", "psf_penalized_aopt_greedy"),
             show_progress=True,
         )
 
     prior: np.ndarray | None = None
+    fitted_subspace: subspace.SubspaceStatistics | None = None
     builders: dict[str, Callable[[], np.ndarray]] = {
-        "uniform_random": lambda: masks.uniform_random_mask(shape, n_samples, rng, n_center),
+        "uniform_random": lambda: masks.uniform_random_mask(
+            shape, n_samples, _named_rng(seed, "mask", "uniform_random"), n_center
+        ),
         "variable_density": lambda: masks.variable_density_mask(
-            shape, n_samples, rng,
+            shape, n_samples, _named_rng(seed, "mask", "variable_density"),
             decay=float(mask_cfg.get("variable_density_decay", 3.0)),
             n_center=n_center,
         ),
         "equispaced_lines": lambda: masks.equispaced_lines_mask(shape, n_samples),
         "variable_density_lines": lambda: masks.variable_density_lines_mask(
-            shape, n_samples, rng,
+            shape, n_samples, _named_rng(seed, "mask", "variable_density_lines"),
             decay=float(lines_cfg.get("decay", 2.0)),
             n_center_lines=n_center_lines,
         ),
         "multilevel_random": lambda: masks.multilevel_random_mask(
-            shape, n_samples, rng,
+            shape, n_samples, _named_rng(seed, "mask", "multilevel_random"),
             n_levels=int(ml_cfg.get("n_levels", 4)),
             decay=float(ml_cfg.get("decay", 1.5)),
+            n_center=n_center,
         ),
         "aopt_greedy": lambda: greedy.greedy_a_optimal(
             _prior(), n_samples, noise_var=noise_var, n_center=n_center
@@ -180,32 +308,34 @@ def build_masks(
         # Backward-compatibility alias for the pre-rename mask type name.
         "artifact_aware_greedy": _psf_penalized,
         "data_driven_greedy": lambda: greedy.greedy_data_driven(
-            train_images.numpy(), n_samples, n_center=n_center
+            _to_numpy(train_images), n_samples, n_center=n_center
         ),
         "line_aopt": lambda: greedy.greedy_line_a_optimal(
             _prior(), n_samples, noise_var=noise_var, n_center_lines=n_center_lines
         ),
         "line_subspace_leakage": lambda: greedy.greedy_lines_subspace_leakage(
-            train_images.numpy(), n_samples,
+            _to_numpy(train_images), n_samples,
             wavelet=wavelet, levels=levels, n_center_lines=n_center_lines,
         ),
         "spectrum_energy_greedy": lambda: greedy.greedy_lines_spectrum_energy(
-            train_images.numpy(), n_samples, n_center_lines=n_center_lines
+            _to_numpy(train_images), n_samples, n_center_lines=n_center_lines
         ),
         "subspace_aopt_greedy": lambda: greedy.greedy_subspace_aoptimal(
             subspace.to_kspace_basis(
-                fit_train_subspace(cfg, train_images)[0], shape
+                _subspace_statistics().basis,
+                shape,
             ),
             n_samples,
-            sigma2=noise_var,
+            sigma2=subspace_regularization(cfg),
+            prior_variances=_subspace_statistics().eigenvalues,
             n_center=n_center,
             beta=float(cfg.get("subspace", {}).get("beta", 0.0)),
             shape=shape,
-            ridge=float(cfg.get("subspace", {}).get("ridge", 1e-6)),
+            ridge=subspace_regularization(cfg),
             n_candidates=int(g.get("n_candidates", 32)),
         ),
         "recon_in_loop_greedy": lambda: greedy.greedy_lines_recon_in_loop(
-            train_images.numpy(), n_samples,
+            _to_numpy(train_images), n_samples,
             n_candidate_lines=int(loop_cfg.get("n_candidate_lines", 12)),
             batch_size=int(loop_cfg.get("batch_size", 8)),
             ista_threshold=float(ista_cfg.get("threshold", 0.02)),
@@ -213,7 +343,7 @@ def build_masks(
             wavelet=wavelet,
             levels=levels,
             n_center_lines=n_center_lines,
-            rng=rng,
+            rng=_named_rng(seed, "mask", "recon_in_loop_greedy"),
             show_progress=True,
         ),
     }
@@ -223,6 +353,12 @@ def build_masks(
         if prior is None:
             prior = fitted_power_law_spectrum(train_images)
         return prior
+
+    def _subspace_statistics() -> subspace.SubspaceStatistics:
+        nonlocal fitted_subspace
+        if fitted_subspace is None:
+            fitted_subspace = fit_train_subspace_statistics(cfg, train_images)
+        return fitted_subspace
 
     out: dict[str, np.ndarray] = {}
     for name in names:
@@ -285,9 +421,14 @@ def build_mask_family(
 
     def kspace_basis() -> np.ndarray:
         if "phi" not in cache:
-            basis, _ = fit_train_subspace(cfg, train_images)
-            cache["phi"] = subspace.to_kspace_basis(basis, shape)
+            statistics = fit_train_subspace_statistics(cfg, train_images)
+            cache["statistics"] = statistics
+            cache["phi"] = subspace.to_kspace_basis(statistics.basis, shape)
         return cache["phi"]
+
+    def subspace_variances() -> np.ndarray:
+        kspace_basis()
+        return cache["statistics"].eigenvalues
 
     specs: list[tuple[str, Callable[[], np.ndarray]]] = []
 
@@ -309,7 +450,13 @@ def build_mask_family(
         specs.append(
             (f"multilevel_L{n_levels}_d{decay:g}",
              lambda L=n_levels, d=decay: masks.multilevel_random_mask(
-                 shape, n_samples, np.random.default_rng(seeds[0]), n_levels=L, decay=d))
+                 shape,
+                 n_samples,
+                 np.random.default_rng(seeds[0]),
+                 n_levels=L,
+                 decay=d,
+                 n_center=n_center,
+             ))
         )
     specs.append(("equispaced_lines", lambda: masks.equispaced_lines_mask(shape, n_samples)))
     for decay in vdl_decays:
@@ -339,20 +486,26 @@ def build_mask_family(
     specs.append(
         ("spectrum_energy_greedy",
          lambda: greedy.greedy_lines_spectrum_energy(
-             train_images.numpy(), n_samples, n_center_lines=n_center_lines))
+             _to_numpy(train_images), n_samples, n_center_lines=n_center_lines))
     )
     specs.append(
         ("line_subspace_leakage",
          lambda: greedy.greedy_lines_subspace_leakage(
-             train_images.numpy(), n_samples,
+             _to_numpy(train_images), n_samples,
              wavelet=wavelet, levels=levels, n_center_lines=n_center_lines))
     )
     for beta in sub_betas:
         specs.append(
             (f"subspace_aopt_b{beta:g}",
              lambda b=beta: greedy.greedy_subspace_aoptimal(
-                 kspace_basis(), n_samples, sigma2=noise_var, n_center=n_center,
-                 beta=b, shape=shape, ridge=float(sub_cfg.get("ridge", 1e-6)),
+                 kspace_basis(),
+                 n_samples,
+                 sigma2=subspace_regularization(cfg),
+                 prior_variances=subspace_variances(),
+                 n_center=n_center,
+                 beta=b,
+                 shape=shape,
+                 ridge=subspace_regularization(cfg),
                  n_candidates=n_candidates))
         )
 
@@ -363,9 +516,31 @@ def build_mask_family(
 
 
 def save_mask_bundle(mask: np.ndarray, name: str, run: Path) -> dict[str, float]:
-    """Save mask array, mask image, and PSF plot; return PSF metrics row."""
+    """Validate and save a mask plus an explicit artifact manifest entry."""
+    mask = np.asarray(mask)
+    if mask.ndim != 2:
+        raise ValueError(f"mask {name!r} must be two-dimensional, got shape {mask.shape}")
+    if not np.isin(mask, (0.0, 1.0)).all():
+        raise ValueError(f"mask {name!r} must be binary")
     _ensure_dir(run / "masks")
     np.save(run / "masks" / f"{name}.npy", mask)
+    manifest_path = run / "masks" / "manifest.json"
+    manifest = {"version": 1, "masks": {}}
+    if manifest_path.exists():
+        with open(manifest_path, encoding="utf-8") as handle:
+            loaded = json.load(handle)
+        if isinstance(loaded, dict) and isinstance(loaded.get("masks"), dict):
+            manifest = loaded
+    manifest["masks"][name] = {
+        "path": f"{name}.npy",
+        "shape": list(mask.shape),
+        "n_samples": int(mask.sum()),
+        "sha256": hashlib.sha256(np.ascontiguousarray(mask).tobytes()).hexdigest(),
+    }
+    temp_path = manifest_path.with_suffix(".json.tmp")
+    with open(temp_path, "w", encoding="utf-8") as handle:
+        json.dump(manifest, handle, indent=2, sort_keys=True)
+    temp_path.replace(manifest_path)
     viz.save_image(mask, run / "masks" / f"{name}.png", title=name)
     viz.plot_psf(mask, run / "psf" / f"{name}_psf.png", title=name)
     row: dict[str, float] = {"mask": name, "n_samples": float(mask.sum())}
@@ -378,6 +553,17 @@ def _ensure_dir(path: Path) -> bool:
     return True
 
 
+def acquisition_family(mask: np.ndarray) -> str:
+    """Classify a binary mask by its realized acquisition geometry."""
+    mask_array = np.asarray(mask)
+    return (
+        "full_cartesian_lines"
+        if mask_array.ndim == 2
+        and np.all(mask_array == mask_array[0:1, :])
+        else "point_sampling"
+    )
+
+
 # ---------------------------------------------------------------------------
 # Reconstruction and evaluation
 # ---------------------------------------------------------------------------
@@ -387,41 +573,55 @@ def reconstruct_all(
     mask: np.ndarray,
     cfg: dict[str, Any],
     generator: torch.Generator | None = None,
+    noise: np.ndarray | torch.Tensor | None = None,
     spectrum: np.ndarray | None = None,
+    prior_mean: np.ndarray | None = None,
     subspace_basis: np.ndarray | None = None,
+    subspace_mean: np.ndarray | None = None,
+    subspace_variances: np.ndarray | None = None,
     gen_model=None,
     gen_z0: torch.Tensor | None = None,
     unet_model=None,
-) -> dict[str, torch.Tensor]:
+    return_measurements: bool = False,
+) -> dict[str, torch.Tensor] | tuple[dict[str, torch.Tensor], torch.Tensor]:
     """Simulate measurements and reconstruct with every configured method.
 
-    zero_filled and wiener are linear diagonal reconstructions: under a
-    diagonal prior the estimator's unsampled frequency coefficients stay at
-    the prior mean (zero), so both remain confined to the observed subspace
-    and their recon_nullspace_norm is ~0. wavelet_ista couples coefficients
-    across a non-Fourier basis and can impute null-space content; the
-    contrast is intentional.
+    Zero filling is confined to the observed subspace. Wiener is a diagonal
+    Gaussian posterior mean: with the empirical ``prior_mean`` used by the
+    main pipeline, it fills unmeasured coefficients with that mean and is
+    therefore explicitly prior-dependent. Wavelet ISTA couples coefficients
+    across a non-Fourier basis and can also impute null-space content.
 
-    spectrum is the mean frequency-domain power estimated on training data
-    only. wiener's regularization weight defaults to the simulated measurement
-    noise variance (recon.wiener_lambda overrides).
+    ``spectrum`` is the centered frequency-domain variance estimated on
+    training data only. ``prior_mean`` is the corresponding complex mean.
+    Wiener's regularization weight defaults to the simulated measurement noise
+    variance (``recon.wiener_lambda`` overrides).
+
+    ``noise`` supplies an explicit full-grid realization. Reusing the same
+    tensor across masks makes a comparison paired and independent of mask
+    iteration order. When ``return_measurements`` is true, the masked
+    measurements are returned with the reconstructions for residual metrics.
 
     With subspace_basis (N x d, fitted on training data), the "subspace"
-    method solves the prior-constrained least squares in closed form; its
-    output lives in the basis span, so it imputes null-space content by
-    construction (recon_nullspace_norm > 0 — intentional; see
-    recon.subspace_recon). With gen_model and gen_z0, the "generative" method
-    optimizes the latent code of a fixed generator per image.
+    method solves the affine Gaussian posterior mean in closed form, using
+    ``subspace_mean`` and ``subspace_variances`` when supplied. Its output can
+    impute null-space content; see ``recon.subspace_recon``. With
+    ``gen_model`` and ``gen_z0``, the "generative" method optimizes a latent
+    code per image.
 
     With unet_model (trained by scripts/12_train_unet.py on training data
     only), the "unet_post" method post-processes the zero-filled magnitude.
-    It is a learned prior arm: it imputes null-space content, and — unlike
-    wavelet_ista with final_dc — it enforces no data consistency, so its
-    consistency_norm is expected to be nonzero. That is a reported property
-    of the method, not a defect.
+    It is a learned prior arm: it imputes null-space content and enforces no
+    hard data consistency, so its observable measurement residual can be
+    nonzero. That is a reported property of the method, not a certificate.
     """
     noise_std = float(cfg.get("measurement", {}).get("noise_std", 0.0))
-    y = recon.simulate_measurements(images, mask, noise_std=noise_std, generator=generator)
+    if noise is None:
+        y = recon.simulate_measurements(
+            images, mask, noise_std=noise_std, generator=generator
+        )
+    else:
+        y = recon.simulate_measurements(images, mask, noise=noise)
     out = {"zero_filled": recon.zero_filled(y)}
 
     if spectrum is None:
@@ -429,10 +629,21 @@ def reconstruct_all(
             "reconstruct_all: no spectrum provided; wiener falls back to scalar shrinkage",
             stacklevel=2,
         )
-        out["wiener"] = recon.ridge(y, mask, float(cfg["recon"]["ridge_lambda"]))
+        out["wiener"] = recon.ridge(
+            y,
+            mask,
+            float(cfg["recon"]["ridge_lambda"]),
+            prior_mean=prior_mean,
+        )
     else:
         lam = float(cfg["recon"].get("wiener_lambda", noise_std**2))
-        out["wiener"] = recon.ridge(y, mask, lam, spectrum=spectrum)
+        out["wiener"] = recon.ridge(
+            y,
+            mask,
+            lam,
+            spectrum=spectrum,
+            prior_mean=prior_mean,
+        )
 
     ista_cfg = cfg["recon"].get("wavelet_ista")
     if ista_cfg:
@@ -449,14 +660,25 @@ def reconstruct_all(
     if unet_model is not None:
         unet_model.eval()
         with torch.no_grad():
-            zf_magnitude = out["zero_filled"].abs().unsqueeze(1)
-            out["unet_post"] = unet_model(zf_magnitude).squeeze(1).to(torch.complex64)
+            parameter = next(unet_model.parameters())
+            zf_magnitude = out["zero_filled"].abs().unsqueeze(1).to(
+                device=parameter.device,
+                dtype=parameter.dtype,
+            )
+            prediction = unet_model(zf_magnitude).squeeze(1)
+            out["unet_post"] = prediction.to(images.device).to(torch.complex64)
 
     sub_cfg = cfg.get("subspace", {})
     if subspace_basis is not None:
-        lam = sub_cfg.get("lam")
-        lam = float(lam) if lam is not None else max(noise_std**2, 1e-8)
-        out["subspace"] = recon.subspace_recon(y, mask, subspace_basis, lam=lam)
+        lam = subspace_regularization(cfg)
+        out["subspace"] = recon.subspace_recon(
+            y,
+            mask,
+            subspace_basis,
+            lam=lam,
+            prior_mean=subspace_mean,
+            coefficient_variances=subspace_variances,
+        )
     if gen_model is not None and gen_z0 is not None:
         gen_cfg = sub_cfg.get("generative", {})
         singles = [
@@ -468,6 +690,8 @@ def reconstruct_all(
             for i in range(y.shape[0])
         ]
         out["generative"] = torch.stack(singles)
+    if return_measurements:
+        return out, y
     return out
 
 
@@ -476,6 +700,7 @@ def metrics_rows(
     truth: torch.Tensor,
     mask: np.ndarray,
     mask_name: str,
+    measurements: torch.Tensor | None = None,
 ) -> list[dict[str, Any]]:
     """Per-image metric rows for every method, including artifact metrics.
 
@@ -486,17 +711,29 @@ def metrics_rows(
     rows = []
     for method, batch in recons.items():
         for i in range(truth.shape[0]):
-            truth_i = truth[i].numpy()
-            recon_i = batch[i].abs().numpy()
+            truth_i = truth[i].detach().cpu().numpy()
+            recon_i = batch[i].detach().cpu().numpy()
             row: dict[str, Any] = {"mask": mask_name, "method": method, "image_index": i}
-            row.update(metrics.evaluate(recon_i, truth_i))
-            row["aliasing_energy_ratio"] = artifacts.aliasing_energy_ratio(truth[i], mask)
+            quality = metrics.evaluate(recon_i, truth_i)
+            quality.pop("mse")  # CSVs use only the explicit MSE names below.
+            row.update(quality)
+            row["magnitude_mse"] = metrics.magnitude_mse(recon_i, truth_i)
+            row["complex_mse"] = metrics.complex_mse(recon_i, truth_i)
+            row["oracle_unsampled_energy_ratio"] = artifacts.aliasing_energy_ratio(
+                truth[i], mask
+            )
             dec = artifacts.decompose_error(batch[i], truth[i], mask)
-            row["artifact_norm"] = dec.artifact_norm
-            row["consistency_norm"] = dec.consistency_norm
+            row["oracle_nullspace_error_norm"] = dec.artifact_norm
+            row["oracle_observed_subspace_error_norm"] = (
+                dec.observed_subspace_error_norm
+            )
             row["recon_nullspace_norm"] = dec.recon_nullspace_norm
-            row["truth_nullspace_norm"] = dec.truth_nullspace_norm
-            row["no_nullspace_content"] = dec.no_nullspace_content
+            row["oracle_truth_nullspace_norm"] = dec.truth_nullspace_norm
+            row["no_reconstructed_nullspace_content"] = dec.no_nullspace_content
+            if measurements is not None:
+                row["measurement_residual_norm"] = artifacts.measurement_residual_norm(
+                    batch[i], measurements[i], mask
+                )
             rows.append(row)
     return rows
 
@@ -517,8 +754,11 @@ def save_examples(
     suffixes _artifact_field.png and _nullspace.png.
     """
     for method, batch in recons.items():
-        recon_images = [batch[i].abs().numpy() for i in indices]
-        error_maps = [artifacts.artifact_map(batch[i], truth[i]).numpy() for i in indices]
+        recon_images = [batch[i].abs().detach().cpu().numpy() for i in indices]
+        error_maps = [
+            artifacts.artifact_map(batch[i], truth[i]).detach().cpu().numpy()
+            for i in indices
+        ]
         decs = [artifacts.decompose_error(batch[i], truth[i], mask) for i in indices]
         titles = [f"test[{i}]" for i in indices]
         viz.save_image_grid(
@@ -535,13 +775,13 @@ def save_examples(
             cmap="inferno",
         )
         viz.save_image_grid(
-            [dec.artifact_field.abs().numpy() for dec in decs],
+            [dec.artifact_field.abs().detach().cpu().numpy() for dec in decs],
             run / "artifact_maps" / f"{mask_name}_{method}_artifact_field.png",
             titles=titles,
             cmap="inferno",
         )
         viz.save_image_grid(
-            [dec.recon_nullspace.abs().numpy() for dec in decs],
+            [dec.recon_nullspace.abs().detach().cpu().numpy() for dec in decs],
             run / "artifact_maps" / f"{mask_name}_{method}_nullspace.png",
             titles=titles,
             cmap="inferno",
@@ -556,7 +796,10 @@ def evaluate_masks(
     prefix: str,
     example_indices: list[int] | None = None,
     spectrum: np.ndarray | None = None,
+    prior_mean: np.ndarray | None = None,
     subspace_basis: np.ndarray | None = None,
+    subspace_mean: np.ndarray | None = None,
+    subspace_variances: np.ndarray | None = None,
     unet_model=None,
     write_examples: bool = True,
 ) -> pd.DataFrame:
@@ -565,31 +808,60 @@ def evaluate_masks(
     Returns the per-image metrics DataFrame (also written to
     runs/<exp>/metrics/<prefix>_metrics.csv).
     """
-    generator = torch.Generator().manual_seed(int(cfg["seed"]))
     n_examples = int(cfg.get("outputs", {}).get("n_examples", 5))
+    noise_std = float(cfg.get("measurement", {}).get("noise_std", 0.0))
+    common_noise = None
+    if noise_std > 0.0:
+        common_noise = recon.sample_complex_noise_like(
+            test_images,
+            noise_std,
+            generator=torch.Generator().manual_seed(int(cfg["seed"]) + 701),
+        )
+    if write_examples and example_indices is None:
+        n_selected = min(n_examples, int(test_images.shape[0]))
+        example_indices = np.unique(
+            np.linspace(0, test_images.shape[0] - 1, n_selected).astype(int)
+        ).tolist()
+    if example_indices is not None and any(
+        index < 0 or index >= test_images.shape[0] for index in example_indices
+    ):
+        raise IndexError("example_indices contains an index outside the test split")
 
     all_rows: list[dict[str, Any]] = []
     psf_rows: list[dict[str, float]] = []
-    recons_by_mask: dict[str, dict[str, torch.Tensor]] = {}
     for name in track(mask_dict, total=len(mask_dict), label=f"evaluate[{prefix}]"):
-        mask = mask_dict[name]
+        mask = np.asarray(mask_dict[name])
+        if tuple(mask.shape) != tuple(test_images.shape[-2:]):
+            raise ValueError(
+                f"mask {name!r} shape {mask.shape} does not match test image "
+                f"shape {tuple(test_images.shape[-2:])}"
+            )
         psf_rows.append(save_mask_bundle(mask, name, run))
-        recons = reconstruct_all(
+        reconstructed = reconstruct_all(
             test_images, mask, cfg,
-            generator=generator, spectrum=spectrum, subspace_basis=subspace_basis,
+            noise=common_noise,
+            spectrum=spectrum,
+            prior_mean=prior_mean,
+            subspace_basis=subspace_basis,
+            subspace_mean=subspace_mean,
+            subspace_variances=subspace_variances,
             unet_model=unet_model,
+            return_measurements=True,
         )
-        recons_by_mask[name] = recons
-        all_rows.extend(metrics_rows(recons, test_images, mask, name))
+        recons, measurements = reconstructed
+        all_rows.extend(
+            metrics_rows(
+                recons,
+                test_images,
+                mask,
+                name,
+                measurements=measurements,
+            )
+        )
+        if write_examples and example_indices:
+            save_examples(test_images, recons, mask, name, run, example_indices)
 
     frame = pd.DataFrame(all_rows)
-    # Each mask/method pair costs three rendered grids; a parameter sweep over
-    # dozens of masks spends more time in matplotlib than in reconstruction.
-    if write_examples:
-        if example_indices is None:
-            example_indices = representative_indices(frame, n_examples, test_images.shape[0])
-        for name, mask in mask_dict.items():
-            save_examples(test_images, recons_by_mask[name], mask, name, run, example_indices)
 
     _ensure_dir(run / "metrics")
     frame.to_csv(run / "metrics" / f"{prefix}_metrics.csv", index=False)
@@ -605,34 +877,58 @@ def argumentation_table(
     energies: dict[str, float] | None = None,
     basis: np.ndarray | None = None,
     baseline_method: str = "zero_filled",
+    noise_std: float = 0.0,
 ) -> pd.DataFrame:
     """Design-time predictors next to measured outcomes, one row per mask.
 
     The point is argumentative rather than descriptive: every predictor claims
     to rank masks before any measurement is simulated, and the outcome columns
-    test that claim. Per-method mean MSE columns (mse_<method>) and PSNR gains
-    over the baseline method (psnr_gain_<method>) are emitted for whichever
-    methods are present in `frame`, so learned and iterative arms join the
-    correlation test automatically.
+    test that claim. Per-method complex and magnitude MSE columns plus PSNR
+    gains over the baseline are emitted for whichever methods are present in
+    ``frame``.
     """
     rows = []
     for name, mask in mask_dict.items():
         sub = frame[frame["mask"] == name]
         base = sub[sub["method"] == baseline_method]
-        row: dict[str, Any] = {"mask": name}
-        row["mask_score"] = artifacts.expected_zero_filled_mse(mask, train_power)
+        n_samples = int(np.asarray(mask).sum())
+        row: dict[str, Any] = {
+            "mask": name,
+            "actual_n_samples": n_samples,
+            "actual_acceleration": float(mask.size / max(n_samples, 1)),
+            "acquisition_family": acquisition_family(mask),
+        }
+        row["mask_score"] = artifacts.expected_zero_filled_mse(
+            mask, train_power, noise_std=noise_std
+        )
+        row["prior_observable_energy_fraction"] = (
+            artifacts.prior_observable_energy_fraction(mask, train_power)
+        )
+        row["prior_unobservable_energy_fraction"] = (
+            1.0 - row["prior_observable_energy_fraction"]
+        )
         row.update(artifacts.psf_metrics(mask))
         row.update(artifacts.spectrum_weighted_psf_metrics(mask, train_power))
         if mass is not None and energies is not None:
             row["wavelet_leakage"] = artifacts.wavelet_leakage_score(mask, mass, energies)
         if basis is not None:
             row["subspace_leakage"] = artifacts.subspace_nullspace_leakage(basis, mask)
-        row["truth_nullspace_norm"] = float(base["truth_nullspace_norm"].mean())
+        row["oracle_truth_nullspace_norm"] = float(
+            base["oracle_truth_nullspace_norm"].mean()
+        )
         for method in sorted(sub["method"].unique()):
             block = sub[sub["method"] == method]
-            row[f"mse_{method}"] = float(block["mse"].mean())
-            row[f"nullspace_{method}"] = float(block["recon_nullspace_norm"].mean())
-            row[f"consistency_{method}"] = float(block["consistency_norm"].mean())
+            row[f"complex_mse_{method}"] = float(block["complex_mse"].mean())
+            row[f"magnitude_mse_{method}"] = float(block["magnitude_mse"].mean())
+            row[f"recon_nullspace_norm_{method}"] = float(
+                block["recon_nullspace_norm"].mean()
+            )
+            row[f"measurement_residual_norm_{method}"] = float(
+                block["measurement_residual_norm"].mean()
+            )
+            row[f"oracle_observed_subspace_error_norm_{method}"] = float(
+                block["oracle_observed_subspace_error_norm"].mean()
+            )
             if method != baseline_method:
                 row[f"psnr_gain_{method}"] = float(
                     block["psnr"].mean() - base["psnr"].mean()
@@ -644,7 +940,12 @@ def argumentation_table(
 def rank_correlations(
     table: pd.DataFrame, predictors: list[str], outcomes: list[str]
 ) -> pd.DataFrame:
-    """Spearman rank correlation of each predictor against each outcome."""
+    """Descriptive Spearman rank correlations over a constructed mask set.
+
+    Masks in a design sweep are dependent, selected objects rather than iid
+    observations, so this helper intentionally does not report classical
+    significance p-values.
+    """
     from scipy.stats import spearmanr
 
     rows = []
@@ -656,22 +957,19 @@ def rank_correlations(
                 continue
             if table[predictor].nunique() < 2 or table[outcome].nunique() < 2:
                 continue
-            rho, p_value = spearmanr(table[predictor], table[outcome])
+            valid = table[[predictor, outcome]].dropna()
+            if len(valid) < 2:
+                continue
+            rho, _ = spearmanr(valid[predictor], valid[outcome])
             rows.append(
                 {
                     "predictor": predictor,
                     "outcome": outcome,
-                    "n_masks": int(len(table)),
+                    "n_masks": int(len(valid)),
                     "spearman_rho": float(rho),
-                    "p_value": float(p_value),
                 }
             )
-    return pd.DataFrame(rows)
-
-
-def representative_indices(frame: pd.DataFrame, n_examples: int, n_test: int) -> list[int]:
-    """Test indices spread across the difficulty range (quantiles of mean NRMSE)."""
-    per_image = frame.groupby("image_index")["nrmse"].mean().reindex(range(n_test))
-    order = per_image.sort_values().index.to_numpy()
-    positions = np.unique(np.linspace(0, len(order) - 1, n_examples).astype(int))
-    return sorted(int(order[p]) for p in positions)
+    return pd.DataFrame(
+        rows,
+        columns=["predictor", "outcome", "n_masks", "spearman_rho"],
+    )

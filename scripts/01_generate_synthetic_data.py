@@ -21,12 +21,14 @@ def main() -> None:
     cfg = load_config(args.config)
     seed_everything(int(cfg["seed"]))
     run = run_dir(cfg)
-    save_config_snapshot(cfg, run, "01_generate_synthetic_data")
+    save_config_snapshot(cfg, run, "01_generate_synthetic_data", cli_args=vars(args))
 
     images = experiment.load_or_generate_dataset(cfg, run, force=True)
-    train, test = experiment.train_test_split(images, cfg)
+    train, validation, test = experiment.train_validation_test_split(images, cfg)
 
-    preview = [images[i].numpy() for i in range(min(16, images.shape[0]))]
+    preview = [
+        images[i].detach().cpu().numpy() for i in range(min(16, images.shape[0]))
+    ]
     viz.save_image_grid(
         preview,
         run / "data" / "preview.png",
@@ -37,7 +39,10 @@ def main() -> None:
     )
 
     print(f"dataset: {experiment.dataset_path(run)}  shape={tuple(images.shape)}")
-    print(f"split:   train={train.shape[0]}  test={test.shape[0]}")
+    print(
+        f"split:   train={train.shape[0]}  validation={validation.shape[0]}  "
+        f"test={test.shape[0]}"
+    )
     print(f"preview: {run / 'data' / 'preview.png'}")
 
 

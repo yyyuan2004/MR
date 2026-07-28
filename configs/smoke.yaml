@@ -1,0 +1,43 @@
+# Minimal end-to-end configuration used by CI. It is a wiring check, not an
+# evidence-producing experiment.
+experiment_name: smoke
+seed: 0
+
+data:
+  n_images: 8
+  image_size: 32
+  n_train: 4
+  n_val: 2
+  n_test: 2
+  phantom: ellipses
+  min_ellipses: 2
+  max_ellipses: 4
+
+measurement:
+  noise_std: 0.005
+
+mask:
+  sampling_fraction: 0.25
+  center_fraction: 0.0
+  variable_density_decay: 2.0
+  lines:
+    n_center_lines: 1
+    decay: 2.0
+  multilevel:
+    n_levels: 3
+    decay: 1.0
+  types:
+    - uniform_random
+    - equispaced_lines
+
+recon:
+  ridge_lambda: 0.05
+  wavelet_ista:
+    threshold: 0.02
+    n_iters: 2
+    wavelet: db2
+    levels: 2
+    final_dc: false
+
+outputs:
+  n_examples: 1

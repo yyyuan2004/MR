@@ -1,158 +1,197 @@
 # Usage
 
-All scripts run from the repository root, take `--config <path>` (default
-`configs/default.yaml`), and write to `runs/<experiment_name>/`. Every script
-saves a JSON snapshot of the config it ran with
-(`runs/<exp>/config_<script>.json`).
+Run scripts from the repository root with `--config <path>`. The default config
+is `configs/default.yaml`. Each resolved config gets a stable fingerprint, and
+outputs are written to:
 
-## Scripts
+```text
+runs/<experiment_name>/<config-hash>/
+```
+
+Each script also saves a JSON manifest containing the full config, command-line
+arguments, package versions, platform, and Git revision when available.
+
+## Core scripts
 
 | Script | Purpose |
 | --- | --- |
-| `01_generate_synthetic_data.py` | Generate and save the dataset plus a preview grid. |
-| `02_make_baseline_masks.py` | Build uniform random, variable density, and equispaced line masks; evaluate on the test split. |
-| `03_reconstruct_and_evaluate.py` | Reconstruct the test split with every mask found in `runs/<exp>/masks/*.npy` (falls back to baselines). |
-| `04_aopt_greedy_mask.py` | Greedy Bayesian A-optimal mask from a power-law prior fitted on the train split. |
-| `05_artifact_aware_mask_search.py` | PSF-penalized A-optimal greedy mask (spectrum-weighted sidelobe penalty, hybrid candidate pool); `--beta-sweep` sweeps the penalty weight and reports Jaccard overlap with plain A-opt. |
-| `06_greedy_data_driven_mask.py` | Greedy mask from the empirical mean spectral energy of the train split. |
-| `07_compare_all_masks.py` | Build every mask in `mask.types`, evaluate, summarize, and plot score vs error. |
-| `08_subspace_mask.py` | Fit a linear subspace on the train split, select a mask by subspace A-optimal greedy, reconstruct with the closed-form subspace method, plot the design-criterion trace. |
-| `09_loupe_baseline.py` | Train a learned probabilistic Cartesian line mask jointly with a U-Net (LOUPE-style); binarize to an exact-budget mask saved for script 10. |
-| `10_compare_manifold_vs_learned.py` | Compare subspace A-optimal, sparse diagonal-prior A-optimal, variable density, and the learned mask; test whether the subspace leakage metric predicts measured errors. |
-| `11_budget_sweep.py` | Sweep the acceleration factor over `budget_sweep.accelerations`, evaluating the full parameterized mask family at each budget; writes one long argumentation table plus per-budget rank correlations. |
-| `12_train_unet.py` | Train the U-Net post-processor (learned prior arm) under a fixed mask; saves `models/unet_post.pt`, which scripts 07 and 11 load automatically. |
-| `13_phase_diagram.py` | Phase diagram from the sweep: acceleration vs coherence, colored by the prior's PSNR gain, with the zero-crossing boundary drawn. |
+| `01_generate_synthetic_data.py` | Generate the configured synthetic dataset and a preview. |
+| `02_make_baseline_masks.py` | Build and evaluate the stable baseline masks. |
+| `03_reconstruct_and_evaluate.py` | Evaluate saved masks, falling back to baselines when none are present. |
+| `04_aopt_greedy_mask.py` | Run the opt-in diagonal-prior A-optimal design. |
+| `05_artifact_aware_mask_search.py` | Run the opt-in PSF-penalized A-optimal design and optional beta sweep. |
+| `06_greedy_data_driven_mask.py` | Run the opt-in train-spectrum greedy design. |
+| `07_compare_all_masks.py` | Build exactly the masks in `mask.types`, reconstruct, summarize, and plot. |
 
-Scripts 02-07 generate the dataset automatically if `runs/<exp>/data/dataset.pt`
-does not exist, so each script is runnable on its own.
+The default evidence path is script 07 with the five non-learned baselines in
+`configs/default.yaml`. Scripts 04-06 are available for targeted ablations but
+are not enabled by default.
 
-## Config reference (`configs/default.yaml`)
+## Experimental scripts
 
-- `experiment_name`: output directory name under `runs/`.
-- `seed`: global seed (Python, NumPy, PyTorch).
-- `data.n_images`, `data.image_size`: dataset size and image side length.
-- `data.n_train`, `data.n_test`: deterministic split (first `n_train` images
-  train, next `n_test` test).
-- `data.phantom`: `ellipses` (random ellipse superpositions) or `shepp_logan`.
-- `measurement.noise_std`: std of complex Gaussian frequency-domain noise.
-  Single source of truth: the greedy criterion's noise variance and the
-  Wiener regularization weight both default to `noise_std ** 2`.
-- `mask.sampling_fraction`: fraction of frequency-domain locations measured;
-  the measurement budget is `round(fraction * H * W)` and is met exactly by
-  every generator.
-- `mask.center_fraction`: fraction of the budget forced onto the lowest
-  spatial frequencies.
-- `mask.variable_density_decay`: polynomial decay exponent of the variable
-  density profile.
-- `mask.lines.n_center_lines`, `mask.lines.decay`: shared settings of the
-  Cartesian-column (line-wise) masks — forced center columns and the density
-  decay of `variable_density_lines`.
-- `mask.multilevel.n_levels`, `mask.multilevel.decay`: dyadic annuli count
-  and per-level density falloff of `multilevel_random`.
-- `mask.types`: masks compared by script 07. Valid names: `uniform_random`,
-  `variable_density`, `equispaced_lines`, `variable_density_lines`,
-  `multilevel_random`, `aopt_greedy`, `psf_penalized_aopt_greedy`
-  (alias: `artifact_aware_greedy`), `line_aopt`, `line_subspace_leakage`,
-  `spectrum_energy_greedy`, `recon_in_loop_greedy`, `data_driven_greedy`.
-- `greedy.noise_var`: noise variance in the A-optimal gain
-  `s_k^2 / (s_k + noise_var)`. Defaults to `measurement.noise_std ** 2`; set
-  it only to deliberately override that invariant.
-- `greedy.beta` (legacy alias `greedy.artifact_beta`): weight of the
-  spectrum-weighted PSF max-sidelobe penalty in the PSF-penalized score.
-- `greedy.beta_sweep`: list of penalty weights swept by script 05
-  `--beta-sweep`.
-- `greedy.n_candidates`: size of the hybrid candidate pool per PSF-penalized
-  step (split between top-gain, radius-weighted random, boundary-ring, and
-  sidelobe-reduction candidates).
-- `greedy.recon_in_loop.n_candidate_lines`, `.batch_size`, `.ista_iters`:
-  candidate columns per step, training-batch size, and iteration count of the
-  cheap in-loop reconstruction used by `recon_in_loop_greedy`.
-- `recon.ridge_lambda`: scalar shrinkage weight, used only on the fallback
-  path when no spectrum is available.
-- `recon.wiener_lambda` (optional): Wiener regularization weight; defaults to
+| Script | Status and purpose |
+| --- | --- |
+| `08_subspace_mask.py` | Experimental linear-subspace design and reconstruction. |
+| `09_loupe_baseline.py` | Experimental LOUPE-style learned Cartesian line mask and U-Net. |
+| `10_compare_manifold_vs_learned.py` | Experimental comparison of subspace, diagonal-prior, and learned designs. |
+| `11_budget_sweep.py` | Exploratory parameter and acceleration sweep; correlations are descriptive diagnostics only. |
+| `12_train_unet.py` | Experimental U-Net post-processor trained on the synthetic train split. |
+
+These scripts are not executed by CI and are not part of the default result
+claim. Learned, subspace, and LOUPE-style results require independent seeds,
+held-out model selection, and an explicitly defined shift protocol before they
+can support comparative conclusions.
+
+## Shipped configurations
+
+### `configs/default.yaml`
+
+- `data`: 60 images of size 64x64; 36 train, 12 validation, 12 test.
+- `data.phantom`: independent draws from `ellipses` for every split.
+- `measurement.noise_std`: 0.005 in complex Fourier space.
+- `mask.sampling_fraction`: 0.25.
+- `mask.types`: `uniform_random`, `variable_density`,
+  `multilevel_random`, `equispaced_lines`, `variable_density_lines`.
+- `recon.wavelet_ista`: 15 iterations, `db4`, 3 levels,
+  `final_dc: false`.
+- `outputs.n_examples`: 3.
+
+The validation split is reserved between train and test. Script 07 estimates
+the frequency-domain mean, centered variance, and second moment from the train
+split and evaluates only the test split; it does not tune on the test data.
+
+`final_dc` is false because the default measurement contains noise. Replacing
+the measured coefficients exactly at the last iteration would also replace
+them with their noisy values. Set it to true only when a hard final
+data-consistency projection is the intended estimator.
+
+### `configs/smoke.yaml`
+
+- 8 images of size 32x32; 4 train, 2 validation, 2 test.
+- 2 masks: `uniform_random` and `equispaced_lines`.
+- 2 wavelet-ISTA iterations and one saved example.
+
+This config verifies imports, data flow, file creation, and the main script. It
+is too small for method ranking or scientific interpretation.
+
+## Configuration keys
+
+- `experiment_name`: first component of the run directory.
+- `seed`: Python, NumPy, and PyTorch seed.
+- `data.n_images`, `data.image_size`: generated dataset size and square image
+  side length.
+- `data.n_train`, `data.n_val`, `data.n_test`: deterministic contiguous split
+  sizes. Their sum must not exceed `n_images`.
+- `data.phantom`: `ellipses` or `shepp_logan`.
+- `measurement.noise_std`: standard deviation of simulated circular complex
+  Gaussian k-space noise.
+- `mask.sampling_fraction`: fraction of Fourier locations acquired.
+- `mask.center_fraction`: fraction of the point budget reserved near the
+  Fourier center for point-mask generators.
+- `mask.variable_density_decay`: point-wise variable-density exponent.
+- `mask.lines.n_center_lines`, `mask.lines.decay`: settings for Cartesian
+  column masks.
+- `mask.multilevel.n_levels`, `mask.multilevel.decay`: annular multilevel
+  baseline settings.
+- `mask.types`: masks built by script 07.
+- `recon.ridge_lambda`: scalar fallback used when no train spectrum is
+  supplied.
+- `recon.wiener_lambda` (optional): overrides the default Wiener weight
   `measurement.noise_std ** 2`.
-- `recon.wavelet_ista`: iterative soft-thresholding parameters (`threshold`,
-  `n_iters`, `wavelet`, `levels`, `final_dc`). Remove the block to skip the
-  method.
-- `mask.family.*`: parameter grids for the expanded mask family used by
-  script 11 — `seeds`, `variable_density_decay`, `variable_density_lines_decay`,
-  `psf_penalized_beta`, `subspace_beta`, and a list of `multilevel`
-  `{n_levels, decay}` specs. Defaults produce 31 masks; a handful of masks
-  gives rank correlations almost no statistical power, so widen these grids
-  rather than reading significance off a short table.
-- `budget_sweep.accelerations`: acceleration factors to sweep
-  (`sampling_fraction = 1 / acceleration`).
-- `unet_post.*`: learned post-processor — `mask_type` (the fixed mask it
-  trains under), `epochs`, `batch_size`, `lr`, `base_channels`.
-- `subspace.d`: dimension of the linear subspace fitted on the train split.
-- `subspace.beta`: sidelobe penalty in the subspace A-optimal greedy
-  (0 = pure A-optimal).
-- `subspace.ridge`: Tikhonov term keeping the design Gram matrix invertible
-  before `d` rows are selected.
-- `subspace.lam`: subspace-reconstruction regularization; `null` defaults to
-  `measurement.noise_std ** 2`.
-- `subspace.generative.steps`, `.lr`: latent-space optimization settings of
-  the generator-manifold reconstruction.
-- `loupe.*`: learned-mask baseline — epochs, batch size, learning rate,
-  sigmoid slopes of the probability map and the relaxed binarization, and
-  U-Net width.
-- `outputs.n_examples`: number of representative examples saved as image grids.
+- `recon.wavelet_ista`: `threshold`, `n_iters`, `wavelet`, `levels`, and
+  `final_dc`. Remove this block to skip wavelet ISTA.
+- `outputs.n_examples`: number of examples saved per mask and method.
+- `experimental.include_unet_in_comparisons`: opt-in switch for loading a
+  compatible checkpoint produced by script 12 into scripts 07 and 11.
+
+Set this switch before running script 12, then use the same unchanged config
+for comparison; the checkpoint and run directory are config-fingerprinted.
+
+The `greedy`, `subspace`, `unet_post`, `budget_sweep`, and `loupe` blocks
+configure opt-in experimental scripts. Their presence does not enable those
+methods in script 07; only `mask.types` controls the default mask comparison.
+
+## Acquisition strata
+
+The code supports two mask geometries:
+
+1. Point masks select individual 2-D Fourier coefficients:
+   `uniform_random`, `variable_density`, and `multilevel_random`.
+2. Cartesian line masks select columns:
+   `equispaced_lines` and `variable_density_lines`.
+
+At 64x64 and 25% sampling, the default budget is 1024 points, exactly 16 full
+columns. At 32x32 and 25% sampling, the smoke budget is 256 points, exactly 8
+full columns. For a non-divisible point budget, line designs leave the
+remainder unspent; output tables record their actual sample count and
+acceleration. Do not compare a point design against a line design as if they
+had the same hardware constraints.
 
 ## Output layout
 
-```
-runs/<experiment_name>/
-  config_<script>.json      config snapshot per script
-  data/dataset.pt           image stack (torch tensor, N x H x W)
-  data/preview.png          first 16 images
-  masks/<name>.npy          binary mask arrays
-  masks/<name>.png          mask images
-  psf/<name>_psf.png        mask, log-magnitude PSF, center-row profile
-  metrics/<prefix>_metrics.csv       per-image metrics
-  metrics/<prefix>_psf_metrics.csv   PSF metrics per mask
-  metrics/summary.csv                aggregated results table (script 07)
-  metrics/argumentation.csv          design-time scores vs measured outcomes (script 07)
-  metrics/argumentation_correlations.csv  Spearman predictor-outcome correlations
-  metrics/beta_sweep.csv             penalty-weight sweep (script 05 --beta-sweep)
-  metrics/budget_sweep.csv           long argumentation table across budgets (script 11)
-  metrics/budget_sweep_correlations.csv  per-budget rank correlations (script 11)
-  models/unet_post.pt                trained post-processor (script 12)
-  budget_<A>x/                       per-acceleration outputs from script 11
-  recon/<mask>_<method>.png          reconstruction grids
-  artifact_maps/<mask>_<method>.png  total error |recon - truth| grids
-  artifact_maps/<mask>_<method>_artifact_field.png  null-space error |(I-P)(recon-truth)|
-  artifact_maps/<mask>_<method>_nullspace.png       invented content |(I-P) recon|
-  plots/score_vs_error.png           mask score vs measured error (script 07)
-  plots/psf_profiles.png             center-row PSF profile overlay (script 07)
-  plots/zoom_comparison.png          crop-and-zoom comparison (script 07)
-  plots/phase_diagram.png            acceleration vs coherence vs prior gain (script 13)
+```text
+runs/<experiment_name>/<config-hash>/
+  config_<script>.json
+  data/dataset.pt
+  data/preview.png
+  masks/<name>.npy
+  masks/<name>.png
+  masks/manifest.json
+  psf/<name>_psf.png
+  metrics/<prefix>_metrics.csv
+  metrics/<prefix>_psf_metrics.csv
+  metrics/summary.csv
+  metrics/argumentation.csv
+  metrics/argumentation_correlations.csv
+  metrics/budget_sweep.csv
+  metrics/budget_sweep_correlations.csv
+  models/unet_post.pt
+  recon/<mask>_<method>.png
+  artifact_maps/<mask>_<method>.png
+  artifact_maps/<mask>_<method>_artifact_field.png
+  artifact_maps/<mask>_<method>_nullspace.png
+  plots/score_vs_error_<acquisition_family>.png
+  plots/psf_profiles.png
+  plots/zoom_comparison.png
 ```
 
-## Metrics
+Some files are produced only by the corresponding experimental script.
 
-- `mse`, `psnr`, `ssim`, `nrmse`: computed on magnitude reconstructions against
-  the ground-truth image.
-- `aliasing_energy_ratio`: `||(I - P) x||^2 / ||x||^2`, the fraction of image
-  energy lost by the sampling projector `P = F^H M F`.
-- `psf_max_sidelobe`: largest off-peak PSF magnitude relative to the peak
-  (mask coherence).
-- `psf_sidelobe_energy`: off-peak fraction of PSF energy. Budget-dominated:
-  by Parseval it equals `1 - budget/N` regardless of arrangement, so it
-  cannot rank masks at a fixed budget; kept for completeness only.
-- `weighted_max_sidelobe`: max magnitude of the prior-weighted PSF outside a
-  main-lobe guard radius — coherence integrated with the training spectrum,
-  so it ranks masks by coherent aliasing of expected signal energy. (Without
-  the guard the prior's autocorrelation main lobe saturates the metric near 1
-  for every mask.)
-- `wavelet_leakage`: energy-weighted fraction of the wavelet subbands'
-  spectral mass on unmeasured locations (information coverage of the
-  reconstruction basis; lower is better).
-- `mask_score`: expected zero-filled per-pixel MSE under the train mean power
-  spectrum (unmeasured spectral energy / number of pixels).
-- `artifact_norm`, `consistency_norm`, `recon_nullspace_norm`,
-  `truth_nullspace_norm`, `no_nullspace_content`: per-image error
-  decomposition by the orthogonal projector `P = F^H M F` — null-space
-  imputation error, observed-subspace error, the reconstruction's and the
-  reference signal's null-space content, and a norm-based flag that is True
-  for reconstructions confined to the observed subspace. See
-  `docs/experiments.md`.
+## Interpretation classes
+
+### Operator/measurement-observable
+
+The mask, sample count, PSF, measured k-space values, and a reconstruction
+residual `||y - A x_hat||` require no test ground truth. PSF metrics describe
+the operator geometry; they do not certify reconstruction error by themselves.
+
+### Prior-derived but test-truth-free
+
+`mask_score`, `prior_observable_energy_fraction`, weighted PSF,
+`wavelet_leakage`, and subspace leakage are estimated from training data or a
+chosen representation. They are design-time diagnostics, but their validity
+under distribution shift is an assumption to be tested rather than a
+distribution-free guarantee.
+
+### Oracle evaluation only
+
+The following current outputs use the known synthetic test image:
+
+- `complex_mse = mean(|x_hat-x|^2)`;
+- `magnitude_mse = mean((|x_hat|-|x|)^2)`, PSNR, SSIM, and NRMSE;
+- `oracle_unsampled_energy_ratio = ||(I-P)x||^2 / ||x||^2`;
+- `oracle_nullspace_error_norm = ||(I-P)(x_hat-x)||`;
+- `oracle_observed_subspace_error_norm = ||P(x_hat-x)||`;
+- `oracle_truth_nullspace_norm = ||(I-P)x||`.
+
+They are valid offline evaluation metrics in simulation. They are not
+available for an unknown deployed sample and must not be presented as
+observable per-sample certificates.
+
+## Correlation outputs
+
+Script 07 and the exploratory sweep write descriptive Spearman correlations
+within acquisition strata. They intentionally omit nominal p-values because
+the constructed masks are dependent, selected designs rather than iid
+observations. The repository does not implement repeated-seed inference or an
+independent confirmatory dataset.

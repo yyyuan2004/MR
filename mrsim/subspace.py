@@ -10,36 +10,93 @@ only at the generator boundary.
 
 from __future__ import annotations
 
+from dataclasses import dataclass
+
 import numpy as np
 import torch
 
 from .fft_ops import fft2c
 
 
+@dataclass(frozen=True)
+class SubspaceStatistics:
+    """SVD subspace together with the statistics needed by a Gaussian prior.
+
+    ``eigenvalues`` contains the coefficient variances of the retained modes.
+    For a centered fit these are the leading sample-covariance eigenvalues;
+    for a legacy through-origin fit they are leading second-moment
+    eigenvalues.  ``mean`` is always the empirical image mean as a flat vector.
+    """
+
+    basis: np.ndarray
+    mean: np.ndarray
+    eigenvalues: np.ndarray
+    energy_ratio: float
+    total_variance: float
+    image_shape: tuple[int, int]
+    centered: bool
+
+    @property
+    def mean_image(self) -> np.ndarray:
+        """Empirical mean reshaped to the original image dimensions."""
+        return self.mean.reshape(self.image_shape)
+
+    @property
+    def covariance_factor(self) -> np.ndarray:
+        """Matrix ``B sqrt(Lambda)`` whose product forms the fitted covariance."""
+        return self.basis * np.sqrt(self.eigenvalues)[None, :]
+
+
 def fit_subspace(
-    train_images: np.ndarray | torch.Tensor, d: int
-) -> tuple[np.ndarray, float]:
+    train_images: np.ndarray | torch.Tensor,
+    d: int,
+    *,
+    center: bool = False,
+    return_statistics: bool = False,
+) -> tuple[np.ndarray, float] | SubspaceStatistics:
     """Fit a d-dimensional linear subspace to vectorized training images.
 
-    Returns the image-domain orthonormal basis U (N x d, columns are the top
-    right singular vectors of the data matrix) and the fraction of training
-    energy the subspace captures.
+    Existing two-argument calls retain the historical through-origin fit and
+    return ``(basis, energy_ratio)``.  For a statistically specified prior,
+    call ``fit_subspace(..., center=True, return_statistics=True)`` to obtain
+    the empirical mean, covariance eigenvalues, basis, and explained-variance
+    ratio in a :class:`SubspaceStatistics` object.
     """
     if isinstance(train_images, torch.Tensor):
-        train_images = train_images.numpy()
-    images = np.asarray(train_images, dtype=np.float64)
+        train_images = train_images.detach().cpu().numpy()
+    raw_images = np.asarray(train_images)
+    dtype = np.complex128 if np.iscomplexobj(raw_images) else np.float64
+    images = np.asarray(raw_images, dtype=dtype)
     if images.ndim != 3:
         raise ValueError("train_images must have shape (n, H, W)")
     n = images.shape[0]
     data = images.reshape(n, -1)
-    if not (1 <= d <= min(n, data.shape[1])):
-        raise ValueError(f"d={d} must be in [1, {min(n, data.shape[1])}]")
+    max_rank = min(n - 1, data.shape[1]) if center else min(n, data.shape[1])
+    if not (1 <= d <= max_rank):
+        qualifier = " for a centered fit" if center else ""
+        raise ValueError(f"d={d} must be in [1, {max_rank}]{qualifier}")
 
-    _, singular_values, vt = np.linalg.svd(data, full_matrices=False)
+    mean = data.mean(axis=0)
+    fitted_data = data - mean if center else data
+    _, singular_values, vt = np.linalg.svd(fitted_data, full_matrices=False)
     basis = vt[:d].conj().T
     energy = singular_values**2
-    energy_ratio = float(energy[:d].sum() / max(energy.sum(), 1e-30))
-    return basis, energy_ratio
+    total_energy = float(energy.sum())
+    energy_ratio = float(energy[:d].sum() / total_energy) if total_energy > 0.0 else 0.0
+    normalization = n - 1 if center else n
+    eigenvalues = np.asarray(energy[:d] / normalization, dtype=np.float64)
+    statistics = SubspaceStatistics(
+        basis=basis,
+        mean=mean,
+        eigenvalues=eigenvalues,
+        energy_ratio=energy_ratio,
+        total_variance=total_energy / normalization,
+        image_shape=(images.shape[1], images.shape[2]),
+        centered=center,
+    )
+    if return_statistics:
+        return statistics
+    return statistics.basis, statistics.energy_ratio
 
 
 def to_kspace_basis(basis: np.ndarray, shape: tuple[int, int] | None = None) -> np.ndarray:

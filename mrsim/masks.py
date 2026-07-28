@@ -1,4 +1,4 @@
-"""Baseline frequency-domain measurement mask generators with exact budgets."""
+"""Frequency-domain masks with explicit point and full-line acquisition budgets."""
 
 from __future__ import annotations
 
@@ -17,6 +17,32 @@ def validate_budget(shape: tuple[int, int], n_samples: int, n_center: int = 0) -
         raise ValueError(f"n_samples={n_samples} must be in [1, {total}]")
     if not (0 <= n_center <= n_samples):
         raise ValueError(f"n_center={n_center} must be in [0, n_samples={n_samples}]")
+
+
+def line_count_from_sample_budget(shape: tuple[int, int], n_samples: int) -> int:
+    """Maximum number of complete Cartesian columns within a point budget.
+
+    A Cartesian readout acquires a complete column, so a point budget that is
+    not divisible by the column height cannot be met exactly without changing
+    the acquisition model.  The unused remainder is therefore left unspent.
+    Budgets smaller than one complete column are invalid for line sampling.
+    """
+    validate_budget(shape, n_samples)
+    n_rows = shape[0]
+    n_lines = n_samples // n_rows
+    if n_lines < 1:
+        raise ValueError(
+            f"n_samples={n_samples} cannot acquire one complete Cartesian "
+            f"column of {n_rows} samples"
+        )
+    return n_lines
+
+
+def validate_line_count(shape: tuple[int, int], n_lines: int) -> None:
+    """Validate an explicit complete-column acquisition budget."""
+    n_cols = shape[1]
+    if not (1 <= n_lines <= n_cols):
+        raise ValueError(f"n_lines={n_lines} must be in [1, {n_cols}]")
 
 
 def radius_map(shape: tuple[int, int]) -> np.ndarray:
@@ -76,45 +102,53 @@ def variable_density_mask(
     return mask_from_indices(shape, np.concatenate([center, chosen]))
 
 
-def fill_lines(shape: tuple[int, int], cols_by_priority: np.ndarray, n_samples: int) -> np.ndarray:
-    """Build a Cartesian column mask from a priority-ordered column list.
-
-    The highest-priority columns are fully sampled; the last needed column is
-    filled partially (rows from the center outward) so the measurement budget
-    is met exactly.
-    """
-    validate_budget(shape, n_samples)
-    n_rows = shape[0]
-    n_full = n_samples // n_rows
-    remainder = n_samples - n_full * n_rows
-    needed = n_full + (1 if remainder else 0)
-    if needed > cols_by_priority.size:
-        raise ValueError(f"need {needed} columns but only {cols_by_priority.size} were provided")
+def fill_full_lines(
+    shape: tuple[int, int], cols_by_priority: np.ndarray, n_lines: int
+) -> np.ndarray:
+    """Build a mask containing exactly ``n_lines`` complete Cartesian columns."""
+    validate_line_count(shape, n_lines)
+    cols = np.asarray(cols_by_priority)
+    if cols.ndim != 1:
+        raise ValueError("cols_by_priority must be one-dimensional")
+    if not np.issubdtype(cols.dtype, np.integer):
+        if not np.all(np.isfinite(cols)) or not np.all(cols == np.floor(cols)):
+            raise ValueError("column indices must be finite integers")
+    cols = cols.astype(np.int64, copy=False)
+    if cols.size < n_lines:
+        raise ValueError(f"need {n_lines} columns but only {cols.size} were provided")
+    if np.any((cols < 0) | (cols >= shape[1])):
+        raise ValueError(f"column indices must be in [0, {shape[1] - 1}]")
+    if np.unique(cols[:n_lines]).size != n_lines:
+        raise ValueError("the selected priority prefix contains duplicate columns")
 
     mask = np.zeros(shape, dtype=np.float32)
-    mask[:, cols_by_priority[:n_full]] = 1.0
-    if remainder > 0:
-        rows = np.argsort(np.abs(np.arange(n_rows) - n_rows // 2), kind="stable")[:remainder]
-        mask[rows, cols_by_priority[n_full]] = 1.0
+    mask[:, cols[:n_lines]] = 1.0
     return mask
 
 
-def equispaced_lines_mask(shape: tuple[int, int], n_samples: int) -> np.ndarray:
-    """Fully sampled columns on a regular grid.
+def fill_lines(shape: tuple[int, int], cols_by_priority: np.ndarray, n_samples: int) -> np.ndarray:
+    """Compatibility wrapper using a maximum point budget for full columns.
 
-    A final partial column (filled from the center row outward) absorbs the
-    remainder so the sample budget is met exactly.
+    ``n_samples`` is retained for existing callers.  Only the largest number
+    of complete columns that fits within that budget is acquired; no partial
+    column is ever emitted.  New code with an acquisition-unit budget should
+    call :func:`fill_full_lines` directly.
     """
-    validate_budget(shape, n_samples)
-    n_rows, n_cols_total = shape
-    n_cols = int(np.ceil(n_samples / n_rows))
-    # Evenly spaced distinct columns; the step W / n_cols is >= 1.
-    cols = np.floor(np.arange(n_cols) * (n_cols_total / n_cols)).astype(np.int64)
+    n_lines = line_count_from_sample_budget(shape, n_samples)
+    return fill_full_lines(shape, cols_by_priority, n_lines)
+
+
+def equispaced_lines_mask(shape: tuple[int, int], n_samples: int) -> np.ndarray:
+    """Complete Cartesian columns on a regular grid within a point budget."""
+    n_cols_total = shape[1]
+    n_lines = line_count_from_sample_budget(shape, n_samples)
+    # Evenly spaced distinct columns; the step W / n_lines is >= 1.
+    cols = np.floor(np.arange(n_lines) * (n_cols_total / n_lines)).astype(np.int64)
     # Shift so the column nearest the center lands exactly on it.
     nearest = cols[np.argmin(np.abs(cols - n_cols_total // 2))]
     cols = (cols + (n_cols_total // 2 - nearest)) % n_cols_total
     order = np.argsort(np.abs(cols - n_cols_total // 2), kind="stable")
-    return fill_lines(shape, cols[order], n_samples)
+    return fill_full_lines(shape, cols[order], n_lines)
 
 
 def variable_density_lines_mask(
@@ -130,21 +164,25 @@ def variable_density_lines_mask(
     always fully prioritized; the rest are drawn without replacement with
     probability decaying polynomially in the column offset from the center.
     """
-    validate_budget(shape, n_samples)
-    n_rows, n_cols_total = shape
-    needed = int(np.ceil(n_samples / n_rows))
-    n_center_lines = min(n_center_lines, needed)
+    n_cols_total = shape[1]
+    n_lines = line_count_from_sample_budget(shape, n_samples)
+    if n_center_lines < 0:
+        raise ValueError("n_center_lines must be non-negative")
+    n_center_lines = min(n_center_lines, n_lines)
 
     offsets = np.abs(np.arange(n_cols_total) - n_cols_total // 2)
     center_cols = np.argsort(offsets, kind="stable")[:n_center_lines].astype(np.int64)
     remaining = np.setdiff1d(np.arange(n_cols_total, dtype=np.int64), center_cols)
-    prob = (1.0 + offsets[remaining] / (0.1 * n_cols_total)) ** (-decay)
-    prob /= prob.sum()
-    drawn = rng.choice(remaining, size=needed - n_center_lines, replace=False, p=prob)
-    # Center columns first, then random draws from nearest to farthest, so the
-    # partial column (if any) lands on the least central random draw.
+    n_draw = n_lines - n_center_lines
+    if n_draw:
+        prob = (1.0 + offsets[remaining] / (0.1 * n_cols_total)) ** (-decay)
+        prob /= prob.sum()
+        drawn = rng.choice(remaining, size=n_draw, replace=False, p=prob)
+    else:
+        drawn = np.empty(0, dtype=np.int64)
+    # Center columns first, then random draws from nearest to farthest.
     drawn = drawn[np.argsort(offsets[drawn], kind="stable")]
-    return fill_lines(shape, np.concatenate([center_cols, drawn]), n_samples)
+    return fill_full_lines(shape, np.concatenate([center_cols, drawn]), n_lines)
 
 
 def multilevel_random_mask(
@@ -153,6 +191,7 @@ def multilevel_random_mask(
     rng: np.random.Generator,
     n_levels: int = 4,
     decay: float = 1.5,
+    n_center: int = 0,
 ) -> np.ndarray:
     """Multilevel random sampling over dyadic radial annuli.
 
@@ -162,20 +201,30 @@ def multilevel_random_mask(
     level, locations are drawn uniformly without replacement. Leftover budget
     cascades outward (and back inward) so the total is met exactly.
     """
-    validate_budget(shape, n_samples)
+    validate_budget(shape, n_samples, n_center)
+    if n_levels < 1:
+        raise ValueError("n_levels must be positive")
+    if not np.isfinite(decay) or decay < 0.0:
+        raise ValueError("decay must be finite and non-negative")
     r = radius_map(shape).ravel()
     r_max = float(r.max())
     # Dyadic annulus edges: [0, r_max/2^(L-1), ..., r_max/2, r_max].
     edges = [0.0] + [r_max / 2 ** (n_levels - 1 - l) for l in range(n_levels)]
     level_of = np.digitize(r, edges[1:-1])
-    sizes = np.bincount(level_of, minlength=n_levels)
+    center = center_indices(shape, n_center)
+    available = np.ones(r.size, dtype=bool)
+    available[center] = False
+    sizes = np.bincount(level_of[available], minlength=n_levels)
 
     density = 2.0 ** (-decay * np.arange(n_levels))
     weights = sizes * density
-    targets = np.floor(n_samples * weights / weights.sum()).astype(np.int64)
+    remaining_budget = n_samples - center.size
+    if remaining_budget == 0:
+        return mask_from_indices(shape, center)
+    targets = np.floor(remaining_budget * weights / weights.sum()).astype(np.int64)
     targets = np.minimum(targets, sizes)
     # Distribute the remaining budget innermost-first into levels with room.
-    shortfall = n_samples - int(targets.sum())
+    shortfall = remaining_budget - int(targets.sum())
     for level in list(range(n_levels)) * 2:
         if shortfall <= 0:
             break
@@ -185,11 +234,15 @@ def multilevel_random_mask(
         shortfall -= add
 
     chosen = [
-        rng.choice(np.flatnonzero(level_of == level), size=int(targets[level]), replace=False)
+        rng.choice(
+            np.flatnonzero((level_of == level) & available),
+            size=int(targets[level]),
+            replace=False,
+        )
         for level in range(n_levels)
         if targets[level] > 0
     ]
-    return mask_from_indices(shape, np.concatenate(chosen))
+    return mask_from_indices(shape, np.concatenate([center, *chosen]))
 
 
 def jaccard(mask_a: np.ndarray, mask_b: np.ndarray) -> float:

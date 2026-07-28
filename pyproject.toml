@@ -14,12 +14,15 @@ dependencies = [
     "scikit-image>=0.22",
     "matplotlib>=3.8",
     "torch>=2.1",
+    "PyWavelets>=1.4",
     "PyYAML>=6.0",
     "pandas>=2.1",
 ]
 
 [project.optional-dependencies]
-dev = ["pytest>=7.4"]
+dev = [
+    "pytest>=7.4",
+]
 
 [tool.setuptools]
 packages = ["mrsim"]
