@@ -86,6 +86,30 @@ def plot_psf(mask: np.ndarray, path: Path, title: str | None = None) -> None:
     plt.close(fig)
 
 
+def plot_series(
+    values: Sequence[float],
+    path: Path,
+    xlabel: str = "step",
+    ylabel: str = "value",
+    title: str | None = None,
+    logy: bool = False,
+) -> None:
+    """Plot a single scalar series (e.g. a trace history or training loss)."""
+    path.parent.mkdir(parents=True, exist_ok=True)
+    fig, ax = plt.subplots(figsize=(6, 4))
+    ax.plot(np.arange(len(values)), values, linewidth=1.4)
+    if logy:
+        ax.set_yscale("log")
+    ax.set_xlabel(xlabel)
+    ax.set_ylabel(ylabel)
+    if title:
+        ax.set_title(title)
+    ax.grid(True, alpha=0.3)
+    fig.tight_layout()
+    fig.savefig(path, dpi=150, bbox_inches="tight")
+    plt.close(fig)
+
+
 def plot_psf_profiles(masks_dict: dict[str, np.ndarray], path: Path) -> None:
     """Overlay the center-row PSF profiles (dB) of several masks in one figure."""
     path.parent.mkdir(parents=True, exist_ok=True)
@@ -177,7 +201,7 @@ def plot_score_vs_error(
     each mask labeled once (at its zero-filled point)."""
     path.parent.mkdir(parents=True, exist_ok=True)
     fig, ax = plt.subplots(figsize=(7, 5.5))
-    markers = {"zero_filled": "o", "wiener": "s", "wavelet_ista": "^"}
+    markers = {"zero_filled": "o", "wiener": "s", "wavelet_ista": "^", "subspace": "D", "generative": "v"}
     for method in sorted(set(methods_col)):
         xs = [s for s, m in zip(scores, methods_col) if m == method]
         ys = [e for e, m in zip(errors, methods_col) if m == method]

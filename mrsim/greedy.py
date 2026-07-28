@@ -1,17 +1,19 @@
-"""Greedy frequency-domain measurement selection strategies.
+"""Greedy measurement selection strategies.
 
-Point-wise selectors use NumPy throughout; the reconstruction-in-the-loop
-line selector additionally runs the torch-based iterative reconstruction.
+Point-wise and line-wise selectors are NumPy-only. The
+reconstruction-in-the-loop selector needs the torch-based iterative
+reconstruction, so it imports torch and `recon` lazily inside the function
+rather than at module scope. (Note that torch still arrives transitively via
+artifacts -> fft_ops, which hosts the core operators, so this keeps the
+module's direct dependency narrow rather than enabling a torch-free install.)
 """
 
 from __future__ import annotations
 
 import numpy as np
-import torch
 from scipy.ndimage import binary_dilation
 
-from . import recon
-from .artifacts import subband_energies, subband_spectral_mass
+from .artifacts import psf_metrics, subband_energies, subband_spectral_mass
 from .masks import center_indices, fill_lines, mask_from_indices, radius_map, validate_budget
 from .progress import track
 
@@ -254,6 +256,102 @@ def greedy_data_driven(
 
 
 # ---------------------------------------------------------------------------
+# Subspace / manifold A-optimal selection
+# ---------------------------------------------------------------------------
+
+def greedy_subspace_aoptimal(
+    phi: np.ndarray,
+    n_samples: int,
+    sigma2: float = 1e-3,
+    n_center: int = 0,
+    beta: float = 0.0,
+    shape: tuple[int, int] | None = None,
+    ridge: float = 1e-6,
+    n_candidates: int = 32,
+    return_trace: bool = False,
+) -> np.ndarray | tuple[np.ndarray, list[float]]:
+    """Greedy A-optimal selection under a subspace/manifold prior.
+
+    Model: y_Omega = Phi_Omega alpha + eps with Phi = F B the frequency-domain
+    basis (N x d). The Fisher information is J = Phi_Omega^H Phi_Omega /
+    sigma^2; each step adds the frequency-domain row maximizing the reduction
+    of trace((Phi_Omega^H Phi_Omega + ridge I)^-1), computed for every
+    candidate at O(d N) per step via the Sherman-Morrison rank-one update
+        delta(k) = ||A_inv v_k||^2 / (1 + v_k^H A_inv v_k),  v_k = conj(Phi[k]).
+    The ridge keeps the matrix invertible before d rows are selected; adding a
+    positive-semidefinite rank-one term can only decrease the regularized
+    trace, so the trace history is monotonically non-increasing.
+
+    With beta > 0, the top candidates by delta are re-scored with
+        score = delta_norm - beta * sidelobe_norm
+    (both min-max normalized over the pool; the sidelobe is
+    artifacts.psf_metrics' max sidelobe of the trial mask), giving an
+    artifact-aware variant. beta = 0 is exactly pure A-optimal.
+
+    The center is force-included and the budget is met exactly; the returned
+    mask matches the existing generator interface. With return_trace, also
+    returns sigma^2 * trace((...)^-1) after initialization and each step.
+    """
+    phi = np.asarray(phi, dtype=np.complex128)
+    n_locations, d = phi.shape
+    if shape is None:
+        side = int(round(np.sqrt(n_locations)))
+        if side * side != n_locations:
+            raise ValueError("cannot infer a square shape; pass shape explicitly")
+        shape = (side, side)
+    if shape[0] * shape[1] != n_locations:
+        raise ValueError("shape does not match the basis row count")
+    validate_budget(shape, n_samples, n_center)
+
+    selected = _preselect_center(shape, n_center)
+    chosen = np.flatnonzero(selected)
+    gram = ridge * np.eye(d) + phi[chosen].conj().T @ phi[chosen]
+    a_inv = np.linalg.inv(gram)
+    # Column k of `scores_mat` is A_inv v_k for every candidate row at once.
+    scores_mat = a_inv @ phi.conj().T
+    trace_history = [float(sigma2 * np.trace(a_inv).real)]
+
+    mask = mask_from_indices(shape, chosen)
+    n_selected = int(selected.sum())
+    while n_selected < n_samples:
+        numer = (np.abs(scores_mat) ** 2).sum(axis=0)
+        denom = 1.0 + np.einsum("nd,dn->n", phi, scores_mat).real
+        delta = np.where(selected, -np.inf, numer / denom)
+
+        if beta > 0.0:
+            k = min(n_candidates, int((~selected).sum()))
+            pool = np.argpartition(delta, -k)[-k:]
+            pool = pool[np.isfinite(delta[pool])]
+            sidelobes = np.empty(pool.size)
+            for i, cand in enumerate(pool):
+                trial = mask.copy()
+                trial.ravel()[cand] = 1.0
+                sidelobes[i] = psf_metrics(trial)["psf_max_sidelobe"]
+            d_spread = float(delta[pool].max() - delta[pool].min())
+            d_norm = (delta[pool] - delta[pool].min()) / d_spread if d_spread > 0 else np.zeros(pool.size)
+            s_spread = float(sidelobes.max() - sidelobes.min())
+            s_norm = (sidelobes - sidelobes.min()) / s_spread if s_spread > 0 else np.zeros(pool.size)
+            best = int(pool[int(np.argmax(d_norm - beta * s_norm))])
+        else:
+            best = int(np.argmax(delta))
+
+        # Sherman-Morrison: A_inv' = A_inv - (m m^H) / denom, m = A_inv v_best,
+        # and the candidate matrix updates as M' = M - m (Phi m)^H / denom.
+        m = scores_mat[:, best].copy()
+        d_best = float(denom[best])
+        a_inv -= np.outer(m, m.conj()) / d_best
+        scores_mat -= np.outer(m, (phi @ m).conj()) / d_best
+        selected[best] = True
+        mask.ravel()[best] = 1.0
+        n_selected += 1
+        trace_history.append(float(sigma2 * np.trace(a_inv).real))
+
+    if return_trace:
+        return mask, trace_history
+    return mask
+
+
+# ---------------------------------------------------------------------------
 # Line-wise (Cartesian column) selection
 # ---------------------------------------------------------------------------
 
@@ -360,6 +458,10 @@ def greedy_lines_recon_in_loop(
     the null space. Candidates mix top empirical-energy columns with random
     draws so the search is not confined to the low-frequency block.
     """
+    import torch
+
+    from . import recon
+
     images = np.asarray(images, dtype=np.float32)
     shape = images.shape[-2:]
     validate_budget(shape, n_samples)

@@ -62,13 +62,19 @@ def decompose_error(
     mask: np.ndarray | torch.Tensor,
     *,
     rel_tol: float = 1e-4,
+    operator=None,
 ) -> ErrorDecomposition:
     """Decompose reconstruction error into observed-subspace and null-space parts.
 
     Single-image contract: recon and truth have shape (H, W); callers loop over
-    batches. Inputs are cast to complex64 internally. All projections reuse the
-    existing orthogonal projector; the null-space projection is computed as
-    (I - P) z = z - projector(z, mask).
+    batches. Inputs are cast to complex64 internally. All projections reuse an
+    orthogonal projector; the null-space projection is computed as
+    (I - P) z = z - P z.
+
+    operator selects the measurement model (any operators.MeasurementOperator);
+    the default is the frequency-domain operator P = F^H M F. The split is a
+    property of the projector alone, so it holds verbatim for other operators
+    such as pixel-domain inpainting.
 
     no_nullspace_content is a norm-based flag: it is True whenever the
     reconstruction's null-space content is negligible relative to the reference
@@ -76,14 +82,15 @@ def decompose_error(
     subspace (zero-filling and every linear diagonal method), not only
     zero-filling.
     """
+    project = projector if operator is None else operator.projector
     recon_c = recon.to(torch.complex64)
     truth_c = truth.to(torch.complex64)
 
     err = recon_c - truth_c
-    consistency_error = projector(err, mask)
+    consistency_error = project(err, mask)
     artifact_field = err - consistency_error
-    recon_nullspace = recon_c - projector(recon_c, mask)
-    truth_nullspace = truth_c - projector(truth_c, mask)
+    recon_nullspace = recon_c - project(recon_c, mask)
+    truth_nullspace = truth_c - project(truth_c, mask)
 
     recon_nullspace_norm = torch.linalg.vector_norm(recon_nullspace).item()
     truth_norm = torch.linalg.vector_norm(truth_c).item()
@@ -246,6 +253,31 @@ def wavelet_leakage_score(
     total_energy = sum(energies.values())
     leak = sum(energies[key] * float((mass[key] * unmeasured).sum()) for key in mass)
     return leak / max(total_energy, 1e-12)
+
+
+def subspace_nullspace_leakage(
+    basis: np.ndarray,
+    mask: np.ndarray,
+    weights: np.ndarray | None = None,
+) -> float:
+    """Fraction of subspace-basis energy lost to the null space under a mask.
+
+    For Phi = F B, column j loses sum_{k unmeasured} |Phi_kj|^2 of its energy
+    to the null space. The columns are combined weighted by their energy
+    (optionally rescaled by `weights`, e.g. singular values), which reduces to
+    ||(I - P) B W||_F^2 / ||B W||_F^2 — the subspace analogue of
+    aliasing_energy_ratio. Lower means the mask observes more of the prior
+    model; 0 means the subspace is fully measured.
+    """
+    from .subspace import to_kspace_basis
+
+    phi = to_kspace_basis(np.asarray(basis), mask.shape)
+    power = np.abs(phi) ** 2
+    scale = np.ones(phi.shape[1]) if weights is None else np.asarray(weights, dtype=np.float64) ** 2
+    unmeasured = (1.0 - mask.ravel())[:, None]
+    lost = float((power * unmeasured).sum(axis=0) @ scale)
+    total = float(power.sum(axis=0) @ scale)
+    return lost / max(total, 1e-30)
 
 
 def expected_zero_filled_mse(mask: np.ndarray, mean_power: np.ndarray) -> float:

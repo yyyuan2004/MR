@@ -22,66 +22,19 @@ from pathlib import Path
 
 import pandas as pd
 import torch
-from scipy.stats import spearmanr
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
 from mrsim import artifacts, experiment, viz
 from mrsim.config import load_config, run_dir, save_config_snapshot, seed_everything
 
-PREDICTORS = ["mask_score", "wavelet_leakage", "weighted_max_sidelobe", "psf_max_sidelobe"]
-OUTCOMES = ["mse_zero_filled", "mse_wavelet_ista", "psnr_gain_ista"]
-
-
-def argumentation_table(
-    mask_dict: dict,
-    frame: pd.DataFrame,
-    train_power,
-    mass: dict,
-    energies: dict,
-) -> pd.DataFrame:
-    """Design-time scores next to measured outcomes, one row per mask.
-
-    The point of this table is argumentative, not just descriptive: each
-    predictor claims to rank masks before any data are measured, and the
-    outcome columns test that claim (see the companion correlation table).
-    """
-    rows = []
-    for name, mask in mask_dict.items():
-        sub = frame[frame["mask"] == name]
-        zf = sub[sub["method"] == "zero_filled"]
-        ista = sub[sub["method"] == "wavelet_ista"]
-        row: dict = {"mask": name}
-        row["mask_score"] = artifacts.expected_zero_filled_mse(mask, train_power)
-        row["wavelet_leakage"] = artifacts.wavelet_leakage_score(mask, mass, energies)
-        row.update(artifacts.spectrum_weighted_psf_metrics(mask, train_power))
-        row.update(artifacts.psf_metrics(mask))
-        row["mse_zero_filled"] = float(zf["mse"].mean())
-        if len(ista):
-            row["mse_wavelet_ista"] = float(ista["mse"].mean())
-            row["psnr_gain_ista"] = float(ista["psnr"].mean() - zf["psnr"].mean())
-            row["ista_nullspace_norm"] = float(ista["recon_nullspace_norm"].mean())
-        rows.append(row)
-    return pd.DataFrame(rows)
-
-
-def correlation_table(arg: pd.DataFrame) -> pd.DataFrame:
-    """Spearman rank correlation of each design-time predictor with each outcome."""
-    rows = []
-    for predictor in PREDICTORS:
-        for outcome in OUTCOMES:
-            if outcome not in arg or arg[outcome].isna().all():
-                continue
-            rho, p_value = spearmanr(arg[predictor], arg[outcome])
-            rows.append(
-                {
-                    "predictor": predictor,
-                    "outcome": outcome,
-                    "spearman_rho": float(rho),
-                    "p_value": float(p_value),
-                }
-            )
-    return pd.DataFrame(rows)
+PREDICTORS = [
+    "mask_score",
+    "wavelet_leakage",
+    "weighted_max_sidelobe",
+    "psf_max_sidelobe",
+    "truth_nullspace_norm",
+]
 
 
 def main() -> None:
@@ -102,7 +55,13 @@ def main() -> None:
 
     # Mean power spectrum of the train split: prior for wiener and mask scores.
     train_power = experiment.mean_power_spectrum(train)
-    frame = experiment.evaluate_masks(mask_dict, test, cfg, run, prefix="compare", spectrum=train_power)
+    unet = experiment.load_unet(run)
+    if unet is not None:
+        print("including the trained U-Net post-processor as 'unet_post'")
+    frame = experiment.evaluate_masks(
+        mask_dict, test, cfg, run, prefix="compare",
+        spectrum=train_power, unet_model=unet,
+    )
 
     scores = {
         name: artifacts.expected_zero_filled_mse(mask, train_power)
@@ -125,9 +84,12 @@ def main() -> None:
     levels = int(ista_cfg.get("levels", 3))
     mass = artifacts.subband_spectral_mass(train_power.shape, wavelet=wavelet, levels=levels)
     energies = artifacts.subband_energies(train.numpy(), wavelet=wavelet, levels=levels)
-    arg = argumentation_table(mask_dict, frame, train_power, mass, energies)
+    arg = experiment.argumentation_table(
+        mask_dict, frame, train_power, mass=mass, energies=energies
+    )
     arg.to_csv(run / "metrics" / "argumentation.csv", index=False)
-    corr = correlation_table(arg)
+    outcomes = [c for c in arg.columns if c.startswith(("mse_", "psnr_gain_"))]
+    corr = experiment.rank_correlations(arg, PREDICTORS, outcomes)
     corr.to_csv(run / "metrics" / "argumentation_correlations.csv", index=False)
 
     # Plots: score vs error, PSF profile overlay, crop-and-zoom comparison.

@@ -16,6 +16,12 @@ saves a JSON snapshot of the config it ran with
 | `05_artifact_aware_mask_search.py` | PSF-penalized A-optimal greedy mask (spectrum-weighted sidelobe penalty, hybrid candidate pool); `--beta-sweep` sweeps the penalty weight and reports Jaccard overlap with plain A-opt. |
 | `06_greedy_data_driven_mask.py` | Greedy mask from the empirical mean spectral energy of the train split. |
 | `07_compare_all_masks.py` | Build every mask in `mask.types`, evaluate, summarize, and plot score vs error. |
+| `08_subspace_mask.py` | Fit a linear subspace on the train split, select a mask by subspace A-optimal greedy, reconstruct with the closed-form subspace method, plot the design-criterion trace. |
+| `09_loupe_baseline.py` | Train a learned probabilistic Cartesian line mask jointly with a U-Net (LOUPE-style); binarize to an exact-budget mask saved for script 10. |
+| `10_compare_manifold_vs_learned.py` | Compare subspace A-optimal, sparse diagonal-prior A-optimal, variable density, and the learned mask; test whether the subspace leakage metric predicts measured errors. |
+| `11_budget_sweep.py` | Sweep the acceleration factor over `budget_sweep.accelerations`, evaluating the full parameterized mask family at each budget; writes one long argumentation table plus per-budget rank correlations. |
+| `12_train_unet.py` | Train the U-Net post-processor (learned prior arm) under a fixed mask; saves `models/unet_post.pt`, which scripts 07 and 11 load automatically. |
+| `13_phase_diagram.py` | Phase diagram from the sweep: acceleration vs coherence, colored by the prior's PSNR gain, with the zero-crossing boundary drawn. |
 
 Scripts 02-07 generate the dataset automatically if `runs/<exp>/data/dataset.pt`
 does not exist, so each script is runnable on its own.
@@ -68,6 +74,28 @@ does not exist, so each script is runnable on its own.
 - `recon.wavelet_ista`: iterative soft-thresholding parameters (`threshold`,
   `n_iters`, `wavelet`, `levels`, `final_dc`). Remove the block to skip the
   method.
+- `mask.family.*`: parameter grids for the expanded mask family used by
+  script 11 — `seeds`, `variable_density_decay`, `variable_density_lines_decay`,
+  `psf_penalized_beta`, `subspace_beta`, and a list of `multilevel`
+  `{n_levels, decay}` specs. Defaults produce 31 masks; a handful of masks
+  gives rank correlations almost no statistical power, so widen these grids
+  rather than reading significance off a short table.
+- `budget_sweep.accelerations`: acceleration factors to sweep
+  (`sampling_fraction = 1 / acceleration`).
+- `unet_post.*`: learned post-processor — `mask_type` (the fixed mask it
+  trains under), `epochs`, `batch_size`, `lr`, `base_channels`.
+- `subspace.d`: dimension of the linear subspace fitted on the train split.
+- `subspace.beta`: sidelobe penalty in the subspace A-optimal greedy
+  (0 = pure A-optimal).
+- `subspace.ridge`: Tikhonov term keeping the design Gram matrix invertible
+  before `d` rows are selected.
+- `subspace.lam`: subspace-reconstruction regularization; `null` defaults to
+  `measurement.noise_std ** 2`.
+- `subspace.generative.steps`, `.lr`: latent-space optimization settings of
+  the generator-manifold reconstruction.
+- `loupe.*`: learned-mask baseline — epochs, batch size, learning rate,
+  sigmoid slopes of the probability map and the relaxed binarization, and
+  U-Net width.
 - `outputs.n_examples`: number of representative examples saved as image grids.
 
 ## Output layout
@@ -86,6 +114,10 @@ runs/<experiment_name>/
   metrics/argumentation.csv          design-time scores vs measured outcomes (script 07)
   metrics/argumentation_correlations.csv  Spearman predictor-outcome correlations
   metrics/beta_sweep.csv             penalty-weight sweep (script 05 --beta-sweep)
+  metrics/budget_sweep.csv           long argumentation table across budgets (script 11)
+  metrics/budget_sweep_correlations.csv  per-budget rank correlations (script 11)
+  models/unet_post.pt                trained post-processor (script 12)
+  budget_<A>x/                       per-acceleration outputs from script 11
   recon/<mask>_<method>.png          reconstruction grids
   artifact_maps/<mask>_<method>.png  total error |recon - truth| grids
   artifact_maps/<mask>_<method>_artifact_field.png  null-space error |(I-P)(recon-truth)|
@@ -93,6 +125,7 @@ runs/<experiment_name>/
   plots/score_vs_error.png           mask score vs measured error (script 07)
   plots/psf_profiles.png             center-row PSF profile overlay (script 07)
   plots/zoom_comparison.png          crop-and-zoom comparison (script 07)
+  plots/phase_diagram.png            acceleration vs coherence vs prior gain (script 13)
 ```
 
 ## Metrics
