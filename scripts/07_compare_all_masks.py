@@ -2,13 +2,13 @@
 """Default experiment: build every configured mask, reconstruct the test split
 with zero-filled, Wiener, and wavelet-ISTA methods, and compare masks.
 
-Outputs (under runs/<experiment_name>/):
+Outputs (under runs/<experiment_name>/<config-hash>/):
   metrics/compare_metrics.csv        per-image metrics for every mask x method
   metrics/compare_psf_metrics.csv    PSF metrics per mask
   metrics/summary.csv                aggregated results table
   metrics/argumentation.csv          design-time scores vs measured outcomes
   metrics/argumentation_correlations.csv  Spearman rank correlations
-  plots/score_vs_error.png           mask score vs measured error
+  plots/score_vs_error_<family>.png  stratified score vs measured error
   plots/psf_profiles.png             center-row PSF profile overlay
   plots/zoom_comparison.png          crop-and-zoom comparison (wavelet ISTA)
   masks/, psf/, recon/, artifact_maps/   per-mask images
@@ -25,15 +25,15 @@ import torch
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
-from mrsim import artifacts, experiment, viz
+from mrsim import artifacts, experiment, recon, viz
 from mrsim.config import load_config, run_dir, save_config_snapshot, seed_everything
 
 PREDICTORS = [
     "mask_score",
+    "prior_unobservable_energy_fraction",
     "wavelet_leakage",
     "weighted_max_sidelobe",
     "psf_max_sidelobe",
-    "truth_nullspace_norm",
 ]
 
 
@@ -45,35 +45,64 @@ def main() -> None:
     cfg = load_config(args.config)
     rng = seed_everything(int(cfg["seed"]))
     run = run_dir(cfg)
-    save_config_snapshot(cfg, run, "07_compare_all_masks")
+    save_config_snapshot(cfg, run, "07_compare_all_masks", cli_args=vars(args))
 
     images = experiment.load_or_generate_dataset(cfg, run)
-    train, test = experiment.train_test_split(images, cfg)
+    train, _, test = experiment.train_validation_test_split(images, cfg)
     mask_names = list(cfg["mask"]["types"])
     print(f"building masks: {', '.join(mask_names)}")
     mask_dict = experiment.build_masks(mask_names, cfg, train, rng)
 
-    # Mean power spectrum of the train split: prior for wiener and mask scores.
-    train_power = experiment.mean_power_spectrum(train)
-    unet = experiment.load_unet(run)
+    # Centered prior statistics drive Wiener; the second moment predicts ZF MSE.
+    prior_mean, prior_variance, train_power = experiment.frequency_prior_statistics(train)
+    include_unet = bool(
+        cfg.get("experimental", {}).get("include_unet_in_comparisons", False)
+    )
+    unet = experiment.load_unet(run, cfg=cfg) if include_unet else None
     if unet is not None:
-        print("including the trained U-Net post-processor as 'unet_post'")
+        print("including experimental U-Net post-processor as 'unet_post'")
     frame = experiment.evaluate_masks(
         mask_dict, test, cfg, run, prefix="compare",
-        spectrum=train_power, unet_model=unet,
+        spectrum=prior_variance, prior_mean=prior_mean, unet_model=unet,
     )
 
     scores = {
-        name: artifacts.expected_zero_filled_mse(mask, train_power)
+        name: artifacts.expected_zero_filled_mse(
+            mask,
+            train_power,
+            noise_std=float(cfg.get("measurement", {}).get("noise_std", 0.0)),
+        )
         for name, mask in mask_dict.items()
     }
     summary = (
-        frame.groupby(["mask", "method"])[["mse", "psnr", "ssim", "nrmse", "aliasing_energy_ratio"]]
+        frame.groupby(["mask", "method"])[
+            [
+                "magnitude_mse",
+                "complex_mse",
+                "psnr",
+                "ssim",
+                "nrmse",
+                "oracle_unsampled_energy_ratio",
+                "measurement_residual_norm",
+            ]
+        ]
         .agg(["mean", "std"])
     )
     summary.columns = ["_".join(col) for col in summary.columns]
     summary = summary.reset_index()
     summary["mask_score"] = summary["mask"].map(scores)
+    mask_metadata = pd.DataFrame(
+        [
+            {
+                "mask": name,
+                "actual_n_samples": int(mask.sum()),
+                "actual_acceleration": float(mask.size / mask.sum()),
+                "acquisition_family": experiment.acquisition_family(mask),
+            }
+            for name, mask in mask_dict.items()
+        ]
+    )
+    summary = summary.merge(mask_metadata, on="mask", how="left")
     psf_frame = pd.read_csv(run / "metrics" / "compare_psf_metrics.csv")
     summary = summary.merge(psf_frame, on="mask", how="left")
     summary.to_csv(run / "metrics" / "summary.csv", index=False)
@@ -83,44 +112,87 @@ def main() -> None:
     wavelet = str(ista_cfg.get("wavelet", "db4"))
     levels = int(ista_cfg.get("levels", 3))
     mass = artifacts.subband_spectral_mass(train_power.shape, wavelet=wavelet, levels=levels)
-    energies = artifacts.subband_energies(train.numpy(), wavelet=wavelet, levels=levels)
+    energies = artifacts.subband_energies(
+        train.detach().cpu().numpy(), wavelet=wavelet, levels=levels
+    )
     arg = experiment.argumentation_table(
-        mask_dict, frame, train_power, mass=mass, energies=energies
+        mask_dict,
+        frame,
+        train_power,
+        mass=mass,
+        energies=energies,
+        noise_std=float(cfg.get("measurement", {}).get("noise_std", 0.0)),
     )
     arg.to_csv(run / "metrics" / "argumentation.csv", index=False)
-    outcomes = [c for c in arg.columns if c.startswith(("mse_", "psnr_gain_"))]
-    corr = experiment.rank_correlations(arg, PREDICTORS, outcomes)
+    outcomes = [
+        c
+        for c in arg.columns
+        if c.startswith(("complex_mse_", "magnitude_mse_", "psnr_gain_"))
+    ]
+    corr_parts = []
+    for acquisition_family, family_table in arg.groupby("acquisition_family"):
+        family_corr = experiment.rank_correlations(
+            family_table, PREDICTORS, outcomes
+        )
+        family_corr.insert(0, "acquisition_family", acquisition_family)
+        corr_parts.append(family_corr)
+    corr = pd.concat(corr_parts, ignore_index=True)
     corr.to_csv(run / "metrics" / "argumentation_correlations.csv", index=False)
 
     # Plots: score vs error, PSF profile overlay, crop-and-zoom comparison.
-    viz.plot_score_vs_error(
-        summary["mask"].tolist(),
-        summary["method"].tolist(),
-        summary["mask_score"].tolist(),
-        summary["mse_mean"].tolist(),
-        run / "plots" / "score_vs_error.png",
-    )
+    for acquisition_family, family_summary in summary.groupby(
+        "acquisition_family"
+    ):
+        viz.plot_score_vs_error(
+            family_summary["mask"].tolist(),
+            family_summary["method"].tolist(),
+            family_summary["mask_score"].tolist(),
+            family_summary["complex_mse_mean"].tolist(),
+            run / "plots" / f"score_vs_error_{acquisition_family}.png",
+        )
     viz.plot_psf_profiles(mask_dict, run / "plots" / "psf_profiles.png")
 
-    # Zoom comparison on the median-difficulty test image, wavelet-ISTA method.
-    median_idx = experiment.representative_indices(frame, 3, test.shape[0])[1]
-    generator = torch.Generator().manual_seed(int(cfg["seed"]))
+    # A predeclared middle index avoids choosing a showcase from test outcomes.
+    median_idx = int(test.shape[0] // 2)
+    noise_std = float(cfg.get("measurement", {}).get("noise_std", 0.0))
+    zoom_noise = None
+    if noise_std > 0.0:
+        zoom_noise = recon.sample_complex_noise_like(
+            test[median_idx : median_idx + 1],
+            noise_std,
+            generator=torch.Generator().manual_seed(int(cfg["seed"]) + 702),
+        )
     zoom_recons = {}
     for name, mask in mask_dict.items():
         recons = experiment.reconstruct_all(
-            test[median_idx : median_idx + 1], mask, cfg, generator=generator, spectrum=train_power
+            test[median_idx : median_idx + 1],
+            mask,
+            cfg,
+            noise=zoom_noise,
+            spectrum=prior_variance,
+            prior_mean=prior_mean,
         )
         method = "wavelet_ista" if "wavelet_ista" in recons else "zero_filled"
-        zoom_recons[name] = recons[method][0].abs().numpy()
+        zoom_recons[name] = recons[method][0].abs().detach().cpu().numpy()
     viz.plot_zoom_comparison(
-        test[median_idx].numpy(),
+        test[median_idx].detach().cpu().numpy(),
         zoom_recons,
         run / "plots" / "zoom_comparison.png",
         title=f"test[{median_idx}], wavelet_ista",
     )
 
     print("\nresults table (summary.csv):")
-    cols = ["mask", "method", "psnr_mean", "ssim_mean", "nrmse_mean", "mask_score"]
+    cols = [
+        "acquisition_family",
+        "mask",
+        "method",
+        "actual_acceleration",
+        "psnr_mean",
+        "ssim_mean",
+        "nrmse_mean",
+        "complex_mse_mean",
+        "mask_score",
+    ]
     print(summary[cols].round(4).to_string(index=False))
     print("\nargumentation table (argumentation.csv):")
     print(arg.round(4).to_string(index=False))

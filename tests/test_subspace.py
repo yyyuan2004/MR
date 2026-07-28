@@ -50,6 +50,30 @@ def test_subspace_recon_fills_nullspace():
     assert dec.no_nullspace_content is False
 
 
+def test_centered_subspace_reconstruction_adds_the_prior_mean():
+    mean = np.linspace(0.0, 1.0, SIZE * SIZE, dtype=np.float64).reshape(SIZE, SIZE)
+    basis = np.zeros((SIZE * SIZE, 1), dtype=np.float64)
+    basis[0, 0] = 1.0
+    truth = torch.from_numpy(mean)
+    mask = variable_density_mask((SIZE, SIZE), 64, np.random.default_rng(8))
+    measurements = simulate_measurements(truth, mask)
+
+    reconstructed = subspace_recon(
+        measurements,
+        mask,
+        basis,
+        lam=1e-6,
+        prior_mean=mean,
+    )
+
+    assert torch.allclose(
+        reconstructed,
+        truth.to(torch.complex128),
+        atol=1e-10,
+        rtol=1e-10,
+    )
+
+
 def test_trace_monotonically_decreases():
     phi = to_kspace_basis(_basis(), (SIZE, SIZE))
     _, history = greedy_subspace_aoptimal(
@@ -95,6 +119,33 @@ def test_beta_zero_matches_brute_force_a_optimal():
     mask = greedy_subspace_aoptimal(phi, 12, shape=(8, 8), ridge=ridge, beta=0.0)
     expected = _brute_force_aoptimal(phi, 12, ridge)
     assert np.array_equal(mask.ravel() > 0.5, expected)
+
+
+def test_subspace_aoptimal_uses_anisotropic_prior_variances():
+    # Row 0 measures the low-variance coefficient; row 1 measures the
+    # high-variance coefficient. Isotropic tie-breaking picks row 0, whereas
+    # the PCA-aware design must prioritize row 1.
+    phi = np.array(
+        [
+            [0.0, 1.0],
+            [1.0, 0.0],
+            [0.0, 0.0],
+            [0.0, 0.0],
+        ],
+        dtype=np.complex128,
+    )
+    isotropic = greedy_subspace_aoptimal(
+        phi, 1, shape=(2, 2), ridge=0.1
+    )
+    anisotropic = greedy_subspace_aoptimal(
+        phi,
+        1,
+        shape=(2, 2),
+        ridge=0.1,
+        prior_variances=np.array([100.0, 1.0]),
+    )
+    assert np.flatnonzero(isotropic)[0] == 0
+    assert np.flatnonzero(anisotropic)[0] == 1
 
 
 def test_artifact_aware_beta_changes_only_scoring():

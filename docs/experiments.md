@@ -1,232 +1,187 @@
-# Experiments
+# Experiment interpretation
 
-## Default experiment
+## Current empirical scope
 
-`configs/default.yaml` defines the default experiment:
+The checked-in default experiment is an in-distribution synthetic benchmark:
 
-- 200 synthetic 64x64 random-ellipse test signals; first 120 train, next 80 test.
-- Measurement budget: 25% of the frequency domain (1024 of 4096 locations),
-  with 2% of the budget forced onto the frequency-domain center.
-- Eleven masks: point-wise `uniform_random`, `variable_density`,
-  `multilevel_random`, `aopt_greedy`, `psf_penalized_aopt_greedy`; line-wise
-  (Cartesian columns) `equispaced_lines`, `variable_density_lines`,
-  `line_aopt`, `line_subspace_leakage`, `spectrum_energy_greedy`,
-  `recon_in_loop_greedy`.
-- Complex Gaussian frequency-domain noise with std 0.005. The same noise
-  level drives the greedy criterion's noise variance and the Wiener
-  regularization weight (single source of truth).
-- Reconstruction: zero-filled (`F^H y`), Wiener (per-coefficient shrinkage
-  `s_k / (s_k + noise_var)` with the spectrum estimated on the train split
-  only), and wavelet ISTA (iterative soft-thresholding in a wavelet basis
-  with a final data-consistency step).
-- Outputs: per-image metrics CSV, aggregated summary CSV, mask/PSF images,
-  reconstruction and artifact-map grids for 5 representative test images,
-  and a scatter plot of mask score vs measured reconstruction error.
+- signals are random ellipse images;
+- train, validation, and test splits use the same generator;
+- measurements use an ideal single-coil Cartesian Fourier operator;
+- noise is simulated circular complex Gaussian k-space noise;
+- all images are 64x64 and all default methods run on CPU.
 
-Run it with:
+This setup is useful for checking algebra, data flow, and controlled behavior.
+It is not evidence for clinical MRI, multi-coil reconstruction, CT,
+inpainting, cross-anatomy transfer, cross-device transfer, or robustness to a
+misspecified prior. The operator abstraction in `mrsim/operators.py` is an
+extension point and is exercised by unit tests; it does not enlarge the
+empirical scope of the default study.
 
-```bash
-python scripts/07_compare_all_masks.py --config configs/default.yaml
+## Default comparison
+
+`configs/default.yaml` generates 60 images and uses 36/12/12
+train/validation/test splits. Script 07 compares:
+
+- point-wise baselines: `uniform_random`, `variable_density`, and
+  `multilevel_random`;
+- full-column Cartesian baselines: `equispaced_lines` and
+  `variable_density_lines`.
+
+All masks use a 25% point budget. Because 1024 samples at 64x64 equal 16 full
+columns, the two shipped line masks contain only complete columns. Point and
+line results should be reported separately: equal point counts do not make
+their acquisition constraints equivalent.
+
+The reconstruction methods are zero filling, a diagonal-Gaussian posterior
+mean using train-set frequency mean and variance, and wavelet ISTA. With
+nonzero measurement noise, the shipped config sets
+`wavelet_ista.final_dc: false`; a hard final replacement would reinsert the
+noisy measured coefficients exactly.
+
+## Operator/statistics decomposition
+
+For the ideal masked Fourier operator, let
+
+```text
+A = M F,        P = A* A = F* M F,
+e = R(y) - x.
 ```
 
-## Mask types
+Because `P` is an orthogonal projector,
 
-- **uniform_random** — budget locations drawn uniformly without replacement.
-  Low PSF coherence, but wastes samples on low-energy high frequencies.
-- **variable_density** — sampling probability decays polynomially with |k|,
-  concentrating samples where spectral energy is high while keeping the
-  incoherence of random sampling.
-- **equispaced_lines** — fully sampled columns on a regular grid (plus a
-  partial column to meet the budget exactly). Highly coherent: the PSF has
-  replica peaks, producing structured replica-aliasing artifacts.
-- **variable_density_lines** — whole Cartesian columns drawn with polynomially
-  decaying density; a forced center block plus a partial column meet the
-  budget exactly.
-- **multilevel_random** — dyadic radial annuli with per-level budgets
-  (denser toward the center), uniform random within each level.
-- **aopt_greedy** — greedy Bayesian A-optimal selection under a diagonal
-  Gaussian prior in the frequency domain. The prior spectrum is a radial power law fitted
-  to the train split. Adding location k reduces the expected posterior MSE by
-  `s_k^2 / (s_k + noise_var)`; the greedy loop always adds the largest
-  remaining gain.
-- **psf_penalized_aopt_greedy** (previously `artifact_aware_greedy`; the old
-  name still works) — the A-optimal gain penalized by the PSF max sidelobe:
-  `score = gain / max_gain - beta * max_sidelobe`. The prior enters through
-  the gain term and arrangement coherence through the penalty. Candidates
-  come from a hybrid pool (top gain, radius-weighted random draws, the
-  boundary ring of the current support, and sidelobe-reduction candidates);
-  a pure top-gain pool clusters on the low-frequency disk boundary and
-  collapses this mask onto plain A-opt. Use
-  `scripts/05_artifact_aware_mask_search.py --beta-sweep` to pick `beta`; the
-  sweep reports the Jaccard overlap with plain A-opt per beta.
-- **line_aopt** — A-optimal selection of whole columns; with a diagonal prior
-  the column gain is the sum of its per-location gains, so greedy selection
-  over columns is exact.
-- **line_subspace_leakage** — columns chosen to minimize wavelet-subspace
-  leakage: column gain = sum over wavelet subbands of (training energy in the
-  subband) x (fraction of the subband's spectral mass on that column). This
-  is an information-coverage criterion tied to the reconstruction basis, not
-  raw Fourier energy.
-- **spectrum_energy_greedy** — columns ranked by empirical mean spectral
-  energy of the train split (the line-wise analogue of `data_driven_greedy`).
-- **recon_in_loop_greedy** — columns scored by actually running a cheap
-  wavelet-ISTA on a small training batch for every candidate and keeping the
-  column with the lowest reconstruction error. This is the only criterion
-  that accounts for what the nonlinear method can re-impute from the null
-  space.
-- **data_driven_greedy** — point-wise: uses the empirical mean spectral
-  energy of the train images instead of a fitted prior. By Parseval,
-  zero-filled MSE equals the unmeasured spectral energy, so each greedy step
-  adds the unmeasured location with the largest measured mean `|X_k|^2`. Add
-  it to `mask.types` to include it in the comparison.
+```text
+e = P e + (I-P)e,
+||e||^2 = ||P e||^2 + ||(I-P)e||^2.
+```
 
-## Error decomposition
+The first term lies in the observed subspace. Given a noise bound and the
+known operator, it can be related to the observable residual
+`y - A R(y)`. The second term lies in the null space: two signals on the same
+measurement fiber have identical noiseless measurements, so resolving this
+term requires assumptions or prior information.
 
-The forward operator observes only part of the frequency domain, so signal
-space splits into an observed subspace (the range of the orthogonal projector
-`P = F^H M F`) and its null space. The pipeline reports three error
-quantities per reconstruction:
+The current repository evaluates both terms against known synthetic truth. It
+does not yet turn the residual relation into a calibrated per-sample
+certificate, and it does not prove a distribution-free conditional-coverage
+impossibility theorem. The decomposition is therefore an exact diagnostic
+identity, while the broader certification claims remain theory work outside
+the present experiment.
 
-- **Total error** `|recon - truth|`: everything, undifferentiated.
-- **Observed-subspace (consistency) error** `P (recon - truth)`: disagreement
-  with the measurements inside the observed subspace. For noiseless data and
-  a data-consistent reconstruction this is ~0.
-- **Null-space imputation error** `(I - P)(recon - truth)` (the *artifact
-  field*): content the reconstruction invented or failed to restore in the
-  unobserved directions. Its two ingredients are also reported separately:
-  `(I - P) recon` (invented null-space content) and `(I - P) truth` (the
-  reference signal's null-space component).
+## The certifiable-fraction notation
 
-Linear diagonal reconstructions (zero-filling, Wiener) cannot place energy in
-the null space, so their `recon_nullspace_norm` is ~0 and their artifact field
-equals minus the reference null-space component. Nonlinear methods such as
-wavelet ISTA impute null-space content; whether that imputation is faithful or
-spurious is exactly what the per-image columns (`artifact_norm`,
-`consistency_norm`, `recon_nullspace_norm`, `truth_nullspace_norm`,
-`no_nullspace_content`) and the `_artifact_field.png` / `_nullspace.png`
-magnitude maps make visible.
+A distribution-dependent population quantity can be defined as
 
-## Subspace / manifold priors (scripts 08-10)
+```text
+rho_pi(A) = E_pi ||P x||^2 / E_pi ||x||^2.
+```
 
-The prior can also be a low-dimensional model of the signal class itself,
-abstracted as an N x d basis matrix: a linear subspace (`fit_subspace`, top
-SVD modes of the train split) or the Jacobian of a fixed generator at a
-reference latent point (`generator_jacobian_basis`) — both share one
-selection and reconstruction code path.
+It measures how much signal energy the operator exposes under a specified
+population. Its complement is the population energy placed in the operator's
+null space.
 
-- **Design**: `greedy_subspace_aoptimal` minimizes
-  `trace((Phi_Omega^H Phi_Omega + ridge I)^-1)` for `Phi = F B`, one
-  frequency-domain row at a time, with O(dN)-per-step Sherman-Morrison
-  updates; the regularized trace is monotonically non-increasing (tested).
-  `beta > 0` adds the min-max-normalized PSF max-sidelobe penalty.
-- **Reconstruction**: `subspace_recon` solves the prior-constrained least
-  squares in closed form. Its output lies in the span of the basis, *not* in
-  the observed subspace — so this linear method has
-  `recon_nullspace_norm > 0` by construction, unlike zero-filling and Wiener.
-  The imputation is only as faithful as the prior: with a d-dimensional basis
-  capturing a fraction q of signal energy, the model bias floors the error at
-  roughly the un-captured (1 - q) energy. `generative_recon` replaces the
-  closed form with latent-space gradient descent on a generator.
-- **Learned arm**: `scripts/12_train_unet.py` trains a U-Net post-processor on
-  zero-filled magnitudes (training split only) and registers it as
-  `unet_post`. It imputes null-space content like the other priors, but it
-  enforces no data consistency — there is no analogue of ISTA's `final_dc`
-  step — so its `consistency_norm` is substantially nonzero (on the default
-  run, ~4.6x the zero-filled baseline, which only carries measurement noise).
-  That is a reported property of post-processing, not a defect, and it is
-  precisely the kind of distinction the decomposition exists to expose.
-- **Metric**: `subspace_nullspace_leakage(B, mask)` — the fraction of the
-  basis energy falling on unmeasured locations, the subspace analogue of
-  `aliasing_energy_ratio`. On the default run it ranks all compared masks,
-  including the learned line mask from script 09, in the same order as the
-  measured subspace-reconstruction error (script 10 prints the two rankings
-  and their Spearman correlation; note the sample is small — a handful of
-  masks).
+The per-image CSV field
 
-## Measurement operators
+```text
+oracle_unsampled_energy_ratio(x, A) = ||(I-P)x||^2 / ||x||^2
+```
 
-The decomposition never uses the Fourier transform directly — it only needs
-the orthogonal projector `P = A^H A` onto the observed subspace. `operators.py`
-makes the operator pluggable and ships two:
+is an oracle evaluation quantity because it needs `x`. For one fixed image it
+equals `1 - ||Px||^2/||x||^2`. Across a dataset, however,
+`1 - mean(oracle_unsampled_energy_ratio)` is generally not identical to
+`rho_pi(A)`, which is a ratio of expectations, unless image energies are
+constant or the estimator uses pooled numerator and denominator sums.
 
-- `FourierOperator` (default, `A = M F`): the mask indexes frequencies.
-- `InpaintingOperator` (`A = M`): the mask indexes signal samples, so `P` is
-  already diagonal in the signal domain and the null space is literally the
-  unmeasured pixels.
+The argumentation table reports the pooled train-set estimate as
+`prior_observable_energy_fraction`. Estimating `rho_pi(A)` from the train
+split makes it a prior-derived design diagnostic. Estimating it from test
+truth makes it an oracle evaluation metric. Neither usage is a
+distribution-free property of `A` alone.
 
-`decompose_error(..., operator=...)` accepts either; every identity
-(complementarity, the Pythagorean split, Hermitian idempotent `P`) is tested
-for both. The point is that "whether a prior helps is governed by null-space
-structure" is a statement about the operator's null space, not about Fourier
-sampling.
+## Observable, prior-derived, and oracle quantities
 
-## Budget sweep and the phase diagram
+| Class | Examples | Valid interpretation |
+| --- | --- | --- |
+| Operator/measurement-observable | mask, budget, PSF, measured data, `||y-A x_hat||` | Available without test truth; residual bounds still require a noise statement. |
+| Prior-derived design-time | train second moment, `prior_observable_energy_fraction`, `mask_score`, weighted PSF, wavelet/subspace leakage | Computable before test evaluation, but inherits the assumed training prior. |
+| Oracle evaluation | `complex_mse`, `magnitude_mse`, PSNR/SSIM/NRMSE, `oracle_unsampled_energy_ratio`, `oracle_nullspace_error_norm`, `oracle_observed_subspace_error_norm`, `oracle_truth_nullspace_norm` | Available only because synthetic test truth is known. |
 
-At 4x acceleration the entire low-frequency block fits inside the budget, so
-essentially every sensible design takes the same energy-dense core and
-sampling design barely matters. The capture-energy / control-coherence
-trade-off only becomes real once the budget cannot hold that core, which is
-what 8x and 12x probe. `scripts/11_budget_sweep.py` sweeps the acceleration
-factor over the full parameterized mask family and concatenates the per-budget
-argumentation tables into `metrics/budget_sweep.csv`, printing three decisive
-numbers per budget: whether the PSF penalty has separated from plain
-A-optimal (Jaccard), whether the spectral energy score still predicts the
-nonlinear error, and whether any null-space norm predicts the prior's payoff.
+The observable `measurement_residual_norm` is `||y-A x_hat||`. The separate
+field `oracle_observed_subspace_error_norm` is `||P(x_hat-x)||` and must remain
+in the oracle category.
 
-`scripts/13_phase_diagram.py` renders that table as the summary figure:
-acceleration on x, mask coherence on y, and the prior's PSNR gain as a
-diverging color scale whose neutral midpoint is pinned exactly at zero, with
-the zero level drawn as an explicit contour. The contour is the boundary
-between "the prior helps" and "the prior hurts".
+## Stable baseline masks
 
-## Statistical power
+- `uniform_random`: samples individual coefficients uniformly without
+  replacement.
+- `variable_density`: samples individual coefficients with probability
+  decaying away from the Fourier center.
+- `multilevel_random`: assigns point budgets to radial annuli and samples
+  within each annulus.
+- `equispaced_lines`: samples Cartesian columns on a regular grid.
+- `variable_density_lines`: samples Cartesian columns with a center-biased
+  distribution.
 
-Rank correlations over a handful of masks are not evidence. The default
-comparison in script 07 uses 11 masks, which is enough to see a strong effect
-(`mask_score` vs zero-filled MSE) but far too few to call a weak one
-significant — an observed rho near 0.4 at n = 11 has p ≈ 0.2 and supports no
-conclusion. `experiment.build_mask_family` therefore sweeps each generator's
-free parameters (density decay, level structure, penalty weight, random seed)
-to produce ~31 masks by default, and every correlation row records `n_masks`
-alongside rho and p. Widen `mask.family.*` to push n further.
+Line-mask helpers never partially fill a column. A non-divisible point budget
+is floored to the largest feasible number of complete columns, and output
+tables record the actual sample count and acceleration.
 
-## Argumentation table
+## Experimental opt-in methods
 
-`metrics/summary.csv` is the results table; `metrics/argumentation.csv` is the
-argumentation table. Each row places a mask's design-time scores — computable
-before any measurement is simulated — next to its measured outcomes:
+The following components are research prototypes rather than default
+baselines:
 
-- Predictors: `mask_score` (expected zero-filled MSE under the train
-  spectrum), `wavelet_leakage` (energy-weighted null-space leakage of the
-  reconstruction basis), `weighted_max_sidelobe` (max sidelobe of the
-  prior-weighted PSF), `psf_max_sidelobe` (plain coherence).
-- Outcomes: `mse_zero_filled`, `mse_wavelet_ista`, `psnr_gain_ista` (the
-  nonlinear method's improvement over zero-filling), `ista_nullspace_norm`.
+- diagonal-prior A-optimal and PSF-penalized greedy masks;
+- reconstruction-in-the-loop selection;
+- centered affine Gaussian subspaces (PCA covariance factors) and
+  generator-Jacobian bases;
+- LOUPE-style learned masks;
+- U-Net post-processing;
+- broad parameter and acceleration sweeps.
 
-`metrics/argumentation_correlations.csv` reports Spearman rank correlations of
-every predictor against every outcome across masks. Note that plain PSF
-coherence alone cannot rank masks — it ignores where signal energy sits —
-which is why the spectrum-weighted and leakage predictors exist. The
-`psf_sidelobe_energy` column of the PSF metrics is budget-dominated (by
-Parseval it is fixed at `1 - budget/N` regardless of arrangement) and is kept
-only for completeness; do not use it for ranking.
+Their settings remain in `configs/default.yaml` so the associated scripts can
+be invoked explicitly. They are excluded from `mask.types`, are not run by CI,
+and should not be cited as validated results without:
 
-## Mask score vs true error
+1. independent random seeds and uncertainty reporting;
+2. validation-only model and hyperparameter selection;
+3. a fixed comparison within the same acquisition geometry;
+4. an explicit train/test shift protocol when robustness is the claim;
+5. an untouched confirmatory test set.
 
-The mask score is the expected zero-filled per-pixel MSE under the train mean
-power spectrum. Script 07 plots this predicted score against the measured mean
-MSE on the test split (`plots/score_vs_error.png`). Points near the diagonal
-indicate the spectral model transfers from train to test; deviations flag
-distribution shift, noise effects, or method-specific behavior (Wiener
-shrinkage, null-space imputation by wavelet ISTA).
+## What the current default can and cannot support
 
-## Variations
+The default run can support statements such as:
 
-- Change `mask.sampling_fraction` to sweep the budget.
-- Set `data.phantom: shepp_logan` for the structured Shepp-Logan test image.
-- Increase `measurement.noise_std` to widen the gap between Wiener and
-  zero-filling (the Wiener shrinkage scales with the noise variance).
-- Raise `greedy.artifact_beta` to push the artifact-aware mask toward less
-  coherent patterns; set it to 0 to recover plain A-optimal selection.
-- Use a new `experiment_name` per variation so outputs land in separate
-  `runs/<name>/` directories.
+- the projector decomposition is numerically consistent in the synthetic
+  masked-Fourier setting;
+- mask geometry and oracle reconstruction metrics can be generated
+  reproducibly;
+- point and full-line baselines behave differently under their respective
+  constraints.
+
+It cannot by itself support statements such as:
+
+- a test-time null-space error certificate is observable;
+- one mask is robust to prior misspecification;
+- accuracy-optimal and certifiability-optimal designs provably separate;
+- a regime transition has been established;
+- a nominal rank-correlation p-value supports a confirmatory claim.
+
+Those claims require additional theory and experiments rather than stronger
+wording around the current in-distribution run.
+
+## Recommended evidence sequence
+
+Use the repository in the following order:
+
+1. Run `configs/smoke.yaml` only as an end-to-end wiring check.
+2. Run `configs/default.yaml` and verify the deterministic projector identity,
+   data splits, full-line budgets, and output manifests.
+3. Report point-mask and line-mask baselines separately.
+4. Add repeated seeds before comparing stochastic masks.
+5. Define a train/test distribution shift before evaluating prior robustness.
+6. Reserve learned, subspace, and LOUPE-style arms for explicitly labeled
+   ablations until they pass the same protocol.
+
+Correlation CSVs produced by the scripts are descriptive diagnostics. The
+repository has no confirmatory statistical analysis pipeline.
