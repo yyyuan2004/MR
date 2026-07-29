@@ -40,6 +40,10 @@ PREDICTORS = [
 def main() -> None:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--config", default="configs/default.yaml")
+    parser.add_argument(
+        "--tune-ista", action="store_true",
+        help="select the ISTA threshold per mask on the validation split",
+    )
     args = parser.parse_args()
 
     cfg = load_config(args.config)
@@ -48,7 +52,9 @@ def main() -> None:
     save_config_snapshot(cfg, run, "07_compare_all_masks")
 
     images = experiment.load_or_generate_dataset(cfg, run)
-    train, test = experiment.train_test_split(images, cfg)
+    train, val, test = experiment.train_val_test_split(images, cfg)
+    if args.tune_ista and val.shape[0] == 0:
+        raise SystemExit("--tune-ista needs data.n_val > 0 in the config")
     mask_names = list(cfg["mask"]["types"])
     print(f"building masks: {', '.join(mask_names)}")
     mask_dict = experiment.build_masks(mask_names, cfg, train, rng)
@@ -61,6 +67,7 @@ def main() -> None:
     frame = experiment.evaluate_masks(
         mask_dict, test, cfg, run, prefix="compare",
         spectrum=train_power, unet_model=unet,
+        val_images=val if args.tune_ista else None,
     )
 
     scores = {

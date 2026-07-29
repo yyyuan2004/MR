@@ -230,3 +230,61 @@ shrinkage, null-space imputation by wavelet ISTA).
   coherent patterns; set it to 0 to recover plain A-optimal selection.
 - Use a new `experiment_name` per variation so outputs land in separate
   `runs/<name>/` directories.
+
+## Regularization tuning confounds mask comparison (B1)
+
+A single global `recon.wavelet_ista.threshold` applied to every mask does not
+measure "how much does a sparse prior help this mask" — it measures "how well
+does one arbitrary threshold happen to suit this mask". A mask whose
+zero-filled reconstruction is already near-optimal has little aliasing to
+remove, so a threshold tuned for a harder mask adds bias without removing
+error, and the measured gain can go negative for reasons that have nothing to
+do with null-space structure.
+
+`experiment.tune_ista_threshold` selects the threshold per mask on the
+validation split (`data.n_val`), and `evaluate_masks(..., val_images=...)`
+reports the tuned arm as `wavelet_ista` alongside the fixed-threshold arm as
+`wavelet_ista_fixed`, so the difference is always visible.
+
+Measured on the default config (`scripts/07_compare_all_masks.py --tune-ista`),
+the selected thresholds span the entire grid — 0.0025 to 0.08, a factor of 32 —
+which is direct evidence that no single threshold serves all masks. Of the five
+masks with a negative fixed-threshold gain, two become positive under tuning
+(`aopt_greedy` -0.06 -> +0.25 dB, `psf_penalized_aopt_greedy` -0.20 -> +0.15 dB)
+and three go to essentially zero (-0.46 -> -0.02 dB); none retains a
+meaningfully negative gain. The positive gains also grow
+(`variable_density_lines` 1.65 -> 3.69 dB).
+
+The conclusion is a negative result and is recorded as such: the apparent
+"sparse priors actively hurt energy-dense masks" effect was regularization
+mistuning, not null-space structure. What survives is the much weaker and
+better-supported claim that masks differ substantially in how much a sparse
+prior can help (roughly +0.02 to +3.7 dB here), with the ordering across masks
+preserved. Report tuned gains; quote fixed-threshold gains only as a
+tuning-sensitivity control.
+
+## Choosing the axes of a 2-D diagnostic (B4 pre-check)
+
+`scripts/14_axis_precheck.py` measures candidate axes over the whole mask
+family before any 2-D diagnostic is built: rho(A) (observed fraction of
+training spectral energy), global PSF coherence, and sigma_min(A F W*_S), the
+restricted conditioning on the empirically active wavelet support S. S is fixed
+as the `support_size` largest positions of the training-mean squared wavelet
+coefficient, aggregated over all training images so one support serves every
+mask.
+
+On the 31-mask default family the collinearity runs opposite to intuition:
+
+| pair | Spearman rho |
+| --- | --- |
+| rho(A) vs PSF max sidelobe | +0.460 |
+| rho(A) vs sigma_min | **+0.873** |
+| PSF max sidelobe vs sigma_min | +0.094 |
+
+So sigma_min is the axis that is redundant with rho, while global coherence is
+not. The structural argument that capturing more energy forces low-frequency
+concentration and therefore raises sidelobes does hold *within* the radially
+decaying point-wise families, but the full family also contains
+line-constrained and multilevel masks that break it. Re-run this check whenever
+the mask family changes — the answer depends on the family, not just on the
+metrics.

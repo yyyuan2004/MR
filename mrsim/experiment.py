@@ -2,8 +2,11 @@
 
 from __future__ import annotations
 
+import hashlib
+import threading
 import time
 import warnings
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from pathlib import Path
 from typing import Any, Callable
 
@@ -24,32 +27,103 @@ def dataset_path(run: Path) -> Path:
     return run / "data" / "dataset.pt"
 
 
-def load_or_generate_dataset(cfg: dict[str, Any], run: Path, force: bool = False) -> torch.Tensor:
-    """Load the run's dataset, generating and saving it if needed."""
-    path = dataset_path(run)
-    if path.exists() and not force:
-        return torch.load(path)
+def _file_sha(path: Path) -> str:
+    """Short content hash, so regenerating the file invalidates stale caches."""
+    h = hashlib.sha256()
+    with path.open("rb") as handle:
+        for chunk in iter(lambda: handle.read(1 << 20), b""):
+            h.update(chunk)
+    return h.hexdigest()[:16]
+
+
+def dataset_metadata(cfg: dict[str, Any]) -> dict[str, Any]:
+    """Identity of the dataset a config asks for, used to invalidate the cache."""
     d = cfg["data"]
-    images = data.generate_dataset(
-        n_images=int(d["n_images"]),
-        size=int(d["image_size"]),
-        seed=int(cfg["seed"]),
-        phantom=str(d.get("phantom", "ellipses")),
-        min_ellipses=int(d.get("min_ellipses", 3)),
-        max_ellipses=int(d.get("max_ellipses", 8)),
-    )
+    source = str(d.get("source", "synthetic"))
+    meta: dict[str, Any] = {
+        "seed": int(cfg["seed"]),
+        "n_images": int(d["n_images"]),
+        "image_size": int(d["image_size"]),
+        "source": source,
+    }
+    if source == "synthetic":
+        meta["phantom"] = str(d.get("phantom", "ellipses"))
+        meta["min_ellipses"] = int(d.get("min_ellipses", 3))
+        meta["max_ellipses"] = int(d.get("max_ellipses", 8))
+    else:
+        p = Path(d["path"])
+        meta["path"] = p.as_posix()
+        # Content hash: rewriting the source array at the same path must
+        # invalidate the cache rather than silently reuse stale images.
+        meta["file_sha"] = _file_sha(p)
+    return meta
+
+
+def load_or_generate_dataset(cfg: dict[str, Any], run: Path, force: bool = False) -> torch.Tensor:
+    """Load the run's dataset, generating or importing it if needed.
+
+    data.source selects synthetic phantoms (default) or an external stack via
+    data.path. The cached payload carries its metadata, so switching source,
+    size, count, or the contents of the source file all rebuild the cache
+    instead of silently reusing the previous run's images.
+    """
+    path = dataset_path(run)
+    meta = dataset_metadata(cfg)
+    if path.exists() and not force:
+        payload = torch.load(path, weights_only=False)
+        # Legacy caches stored a bare tensor with no metadata; rebuild those.
+        if isinstance(payload, dict) and payload.get("metadata") == meta:
+            return payload["images"]
+
+    d = cfg["data"]
+    if str(d.get("source", "synthetic")) == "synthetic":
+        images = data.generate_dataset(
+            n_images=int(d["n_images"]),
+            size=int(d["image_size"]),
+            seed=int(cfg["seed"]),
+            phantom=str(d.get("phantom", "ellipses")),
+            min_ellipses=int(d.get("min_ellipses", 3)),
+            max_ellipses=int(d.get("max_ellipses", 8)),
+        )
+    else:
+        images = data.load_array_dataset(
+            d["path"], int(d["n_images"]), int(d["image_size"])
+        )
+
     path.parent.mkdir(parents=True, exist_ok=True)
-    torch.save(images, path)
+    torch.save({"images": images, "metadata": meta}, path)
     return images
 
 
-def train_test_split(images: torch.Tensor, cfg: dict[str, Any]) -> tuple[torch.Tensor, torch.Tensor]:
-    """Deterministic split: first n_train images train, next n_test images test."""
+def train_val_test_split(
+    images: torch.Tensor, cfg: dict[str, Any]
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    """Deterministic sequential split into train / validation / test.
+
+    Slices in order and does NOT shuffle: data.n_val images sit between the
+    train and test blocks. With n_val = 0 (the default) the train and test
+    blocks are byte-identical to the two-way split, so existing configs are
+    unaffected.
+
+    Because the split is sequential, an external stack must be grouped so that
+    all correlated samples (e.g. every slice of one subject) fall in a single
+    contiguous block; interleaved stacking leaks the test set into the prior.
+    """
     d = cfg["data"]
     n_train, n_test = int(d["n_train"]), int(d["n_test"])
-    if n_train + n_test > images.shape[0]:
-        raise ValueError("n_train + n_test exceeds the dataset size")
-    return images[:n_train], images[n_train : n_train + n_test]
+    n_val = int(d.get("n_val", 0))
+    if n_train + n_val + n_test > images.shape[0]:
+        raise ValueError("n_train + n_val + n_test exceeds the dataset size")
+    train = images[:n_train]
+    val = images[n_train : n_train + n_val]
+    test = images[n_train + n_val : n_train + n_val + n_test]
+    return train, val, test
+
+
+def train_test_split(images: torch.Tensor, cfg: dict[str, Any]) -> tuple[torch.Tensor, torch.Tensor]:
+    """Deterministic split: train block, then the test block after any validation block."""
+    train, _, test = train_val_test_split(images, cfg)
+    return train, test
 
 
 # ---------------------------------------------------------------------------
@@ -277,17 +351,23 @@ def build_mask_family(
     )
 
     cache: dict[str, Any] = {}
+    cache_lock = threading.Lock()
 
+    # Guarded so that with n_workers > 1 several threads cannot enter the
+    # cache-miss branch at once and redundantly recompute the fitted spectrum
+    # or the subspace SVD.
     def prior() -> np.ndarray:
-        if "prior" not in cache:
-            cache["prior"] = fitted_power_law_spectrum(train_images)
-        return cache["prior"]
+        with cache_lock:
+            if "prior" not in cache:
+                cache["prior"] = fitted_power_law_spectrum(train_images)
+            return cache["prior"]
 
     def kspace_basis() -> np.ndarray:
-        if "phi" not in cache:
-            basis, _ = fit_train_subspace(cfg, train_images)
-            cache["phi"] = subspace.to_kspace_basis(basis, shape)
-        return cache["phi"]
+        with cache_lock:
+            if "phi" not in cache:
+                basis, _ = fit_train_subspace(cfg, train_images)
+                cache["phi"] = subspace.to_kspace_basis(basis, shape)
+            return cache["phi"]
 
     specs: list[tuple[str, Callable[[], np.ndarray]]] = []
 
@@ -357,6 +437,20 @@ def build_mask_family(
         )
 
     out: dict[str, np.ndarray] = {}
+    workers = int(cfg.get("n_workers", 1) or 1)
+    if workers > 1:
+        # Builders are independent, and NumPy's FFT releases the GIL, so a
+        # thread pool gives real parallelism. Processes are not an option: the
+        # builders are lambdas and cannot be pickled.
+        with ThreadPoolExecutor(max_workers=workers) as pool:
+            futures = {pool.submit(builder): name for name, builder in specs}
+            for future in track(
+                as_completed(futures), total=len(specs), label="build family"
+            ):
+                out[futures[future]] = future.result()
+        # Restore spec order so results never depend on completion order.
+        return {name: out[name] for name, _ in specs}
+
     for name, builder in track(specs, total=len(specs), label="build family"):
         out[name] = builder()
     return out
@@ -392,6 +486,7 @@ def reconstruct_all(
     gen_model=None,
     gen_z0: torch.Tensor | None = None,
     unet_model=None,
+    ista_threshold: float | None = None,
 ) -> dict[str, torch.Tensor]:
     """Simulate measurements and reconstruct with every configured method.
 
@@ -436,15 +531,24 @@ def reconstruct_all(
 
     ista_cfg = cfg["recon"].get("wavelet_ista")
     if ista_cfg:
-        out["wavelet_ista"] = recon.wavelet_ista(
-            y,
-            mask,
-            threshold=float(ista_cfg["threshold"]),
-            n_iters=int(ista_cfg.get("n_iters", 50)),
-            wavelet=str(ista_cfg.get("wavelet", "db4")),
-            levels=int(ista_cfg.get("levels", 3)),
-            final_dc=bool(ista_cfg.get("final_dc", True)),
-        )
+        def run_ista(threshold: float) -> torch.Tensor:
+            return recon.wavelet_ista(
+                y,
+                mask,
+                threshold=threshold,
+                n_iters=int(ista_cfg.get("n_iters", 50)),
+                wavelet=str(ista_cfg.get("wavelet", "db4")),
+                levels=int(ista_cfg.get("levels", 3)),
+                final_dc=bool(ista_cfg.get("final_dc", True)),
+            )
+
+        fixed = float(ista_cfg["threshold"])
+        out["wavelet_ista"] = run_ista(fixed if ista_threshold is None else ista_threshold)
+        # Keep the fixed-threshold arm alongside the tuned one so the gap
+        # between "best achievable ISTA for this mask" and "one global
+        # threshold" is visible rather than assumed away.
+        if ista_threshold is not None and not np.isclose(ista_threshold, fixed):
+            out["wavelet_ista_fixed"] = run_ista(fixed)
 
     if unet_model is not None:
         unet_model.eval()
@@ -476,6 +580,7 @@ def metrics_rows(
     truth: torch.Tensor,
     mask: np.ndarray,
     mask_name: str,
+    extra: dict[str, Any] | None = None,
 ) -> list[dict[str, Any]]:
     """Per-image metric rows for every method, including artifact metrics.
 
@@ -489,6 +594,8 @@ def metrics_rows(
             truth_i = truth[i].numpy()
             recon_i = batch[i].abs().numpy()
             row: dict[str, Any] = {"mask": mask_name, "method": method, "image_index": i}
+            if extra:
+                row.update(extra)
             row.update(metrics.evaluate(recon_i, truth_i))
             row["aliasing_energy_ratio"] = artifacts.aliasing_energy_ratio(truth[i], mask)
             dec = artifacts.decompose_error(batch[i], truth[i], mask)
@@ -559,6 +666,7 @@ def evaluate_masks(
     subspace_basis: np.ndarray | None = None,
     unet_model=None,
     write_examples: bool = True,
+    val_images: torch.Tensor | None = None,
 ) -> pd.DataFrame:
     """Full evaluation of a set of masks: metrics CSV, examples, PSF metrics.
 
@@ -571,16 +679,21 @@ def evaluate_masks(
     all_rows: list[dict[str, Any]] = []
     psf_rows: list[dict[str, float]] = []
     recons_by_mask: dict[str, dict[str, torch.Tensor]] = {}
+    tune = val_images is not None and val_images.shape[0] > 0
     for name in track(mask_dict, total=len(mask_dict), label=f"evaluate[{prefix}]"):
         mask = mask_dict[name]
         psf_rows.append(save_mask_bundle(mask, name, run))
+        threshold = None
+        if tune:
+            threshold, _ = tune_ista_threshold(val_images, mask, cfg)
         recons = reconstruct_all(
             test_images, mask, cfg,
             generator=generator, spectrum=spectrum, subspace_basis=subspace_basis,
-            unet_model=unet_model,
+            unet_model=unet_model, ista_threshold=threshold,
         )
         recons_by_mask[name] = recons
-        all_rows.extend(metrics_rows(recons, test_images, mask, name))
+        extra = {"ista_threshold": threshold} if tune else None
+        all_rows.extend(metrics_rows(recons, test_images, mask, name, extra=extra))
 
     frame = pd.DataFrame(all_rows)
     # Each mask/method pair costs three rendered grids; a parameter sweep over
@@ -595,6 +708,55 @@ def evaluate_masks(
     frame.to_csv(run / "metrics" / f"{prefix}_metrics.csv", index=False)
     pd.DataFrame(psf_rows).to_csv(run / "metrics" / f"{prefix}_psf_metrics.csv", index=False)
     return frame
+
+
+DEFAULT_THRESHOLD_GRID = [0.0025, 0.005, 0.01, 0.02, 0.04, 0.08]
+
+
+def tune_ista_threshold(
+    val_images: torch.Tensor,
+    mask: np.ndarray,
+    cfg: dict[str, Any],
+) -> tuple[float, pd.DataFrame]:
+    """Pick the wavelet-ISTA threshold for one mask on the validation split.
+
+    A single global threshold confounds mask comparison: a mask whose
+    zero-filled reconstruction is already near-optimal has little aliasing to
+    remove, so a threshold tuned for a harder mask only adds bias there and can
+    turn the measured ISTA gain negative. Tuning per mask makes the reported
+    gain mean "best achievable ISTA for this mask vs zero-filling" instead of
+    "one fixed threshold vs zero-filling".
+
+    Selection uses validation images only — never the evaluation split.
+    """
+    ista_cfg = cfg["recon"]["wavelet_ista"]
+    grid = [float(t) for t in ista_cfg.get("threshold_grid", DEFAULT_THRESHOLD_GRID)]
+    noise_std = float(cfg.get("measurement", {}).get("noise_std", 0.0))
+    y = recon.simulate_measurements(
+        val_images, mask, noise_std=noise_std,
+        generator=torch.Generator().manual_seed(int(cfg["seed"])),
+    )
+
+    rows = []
+    for threshold in grid:
+        estimate = recon.wavelet_ista(
+            y, mask, threshold=threshold,
+            n_iters=int(ista_cfg.get("n_iters", 50)),
+            wavelet=str(ista_cfg.get("wavelet", "db4")),
+            levels=int(ista_cfg.get("levels", 3)),
+            final_dc=bool(ista_cfg.get("final_dc", True)),
+        )
+        psnr = float(
+            np.mean([
+                metrics.psnr(estimate[i].abs().numpy(), val_images[i].numpy())
+                for i in range(val_images.shape[0])
+            ])
+        )
+        rows.append({"threshold": threshold, "val_psnr": psnr})
+
+    table = pd.DataFrame(rows)
+    best = float(table.loc[table["val_psnr"].idxmax(), "threshold"])
+    return best, table
 
 
 def argumentation_table(

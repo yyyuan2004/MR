@@ -2,10 +2,18 @@
 experiment_name: default
 seed: 0
 
+n_workers: 1               # >1 builds the mask family on a thread pool (A3)
+
 data:
-  n_images: 200
+  source: synthetic        # synthetic | file
+  # path: runs/data/dataset.pt   # required when source: file
+  # NOTE: the split is sequential and unshuffled. An external stack must be
+  # grouped by subject so all correlated slices land in one contiguous block;
+  # interleaved stacking leaks the test split into the fitted prior.
+  n_images: 220
   image_size: 64
   n_train: 120
+  n_val: 20                # validation split, used to tune the ISTA threshold
   n_test: 80
   phantom: ellipses        # ellipses | shepp_logan
   min_ellipses: 3
@@ -80,7 +88,10 @@ loupe:
 recon:
   ridge_lambda: 0.05       # scalar fallback only (no spectrum available)
   wavelet_ista:
-    threshold: 0.02
+    threshold: 0.02        # fixed fallback; also the "fixed" comparison arm
+    # Grid searched per mask on the validation split when tuning is enabled.
+    # A single global threshold confounds mask comparison — see docs.
+    threshold_grid: [0.0025, 0.005, 0.01, 0.02, 0.04, 0.08]
     n_iters: 50
     wavelet: db4
     levels: 3
