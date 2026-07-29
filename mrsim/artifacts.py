@@ -8,7 +8,7 @@ import numpy as np
 import pywt
 import torch
 
-from .fft_ops import projector
+from .fft_ops import forward_op, projector
 
 
 def decompose(images: torch.Tensor, mask: np.ndarray | torch.Tensor) -> dict[str, torch.Tensor]:
@@ -36,8 +36,11 @@ def artifact_map(recon: torch.Tensor, truth: torch.Tensor) -> torch.Tensor:
 class ErrorDecomposition:
     """Reconstruction error split by the orthogonal projector P = F^H M F.
 
-    consistency_error lives in the observed subspace (range of P); the
-    artifact_field is the null-space part of the error, i.e. spurious or
+    ``consistency_error`` is retained as a backward-compatible name for the
+    oracle quantity ``observed_subspace_error = P(recon - truth)``.  It requires
+    ground truth and is *not* the test-time measurement residual
+    ``y - A(recon)``; use :func:`measurement_residual` for the latter.
+    ``artifact_field`` is the null-space part of the error, i.e. spurious or
     missing null-space content relative to the reference signal.
     """
 
@@ -54,6 +57,66 @@ class ErrorDecomposition:
     truth_nullspace_norm: float
 
     no_nullspace_content: bool
+
+    @property
+    def observed_subspace_error(self) -> torch.Tensor:
+        """Oracle observed-subspace error ``P(recon - truth)``."""
+        return self.consistency_error
+
+    @property
+    def observed_subspace_error_norm(self) -> float:
+        """Norm of the oracle observed-subspace error."""
+        return self.consistency_norm
+
+
+def measurement_residual(
+    recon: torch.Tensor,
+    measurements: np.ndarray | torch.Tensor,
+    mask: np.ndarray | torch.Tensor,
+    *,
+    operator=None,
+) -> torch.Tensor:
+    """Return the test-time computable residual ``measurements - A(recon)``.
+
+    Unlike :func:`decompose_error`, this quantity does not use ground truth.
+    The default forward model is masked Fourier sampling.  ``measurements`` is
+    represented on the same full grid as the forward output, with unmeasured
+    entries equal to zero.
+    """
+    complex_dtype = (
+        torch.complex128
+        if recon.dtype in (torch.float64, torch.complex128)
+        else torch.complex64
+    )
+    recon_c = recon.to(complex_dtype)
+    predicted = (
+        forward_op(recon_c, mask)
+        if operator is None
+        else operator.forward(recon_c, mask)
+    )
+    measured = (
+        torch.from_numpy(np.ascontiguousarray(measurements))
+        if isinstance(measurements, np.ndarray)
+        else measurements
+    )
+    if measured.shape != predicted.shape:
+        raise ValueError(
+            f"measurement shape {tuple(measured.shape)} does not match "
+            f"forward output shape {tuple(predicted.shape)}"
+        )
+    return measured.to(device=predicted.device, dtype=predicted.dtype) - predicted
+
+
+def measurement_residual_norm(
+    recon: torch.Tensor,
+    measurements: np.ndarray | torch.Tensor,
+    mask: np.ndarray | torch.Tensor,
+    *,
+    operator=None,
+) -> float:
+    """Euclidean norm of :func:`measurement_residual`, computable at test time."""
+    residual = measurement_residual(recon, measurements, mask, operator=operator)
+    return torch.linalg.vector_norm(residual).item()
 
 
 def decompose_error(
@@ -78,17 +141,17 @@ def decompose_error(
 
     no_nullspace_content is a norm-based flag: it is True whenever the
     reconstruction's null-space content is negligible relative to the reference
-    signal norm. This holds for any reconstruction confined to the observed
-    subspace (zero-filling and every linear diagonal method), not only
-    zero-filling.
+    signal norm. This holds for reconstructions confined to the observed
+    subspace, such as zero filling and zero-mean diagonal shrinkage. A
+    nonzero prior mean can deliberately add null-space content.
     """
     project = projector if operator is None else operator.projector
     recon_c = recon.to(torch.complex64)
     truth_c = truth.to(torch.complex64)
 
     err = recon_c - truth_c
-    consistency_error = project(err, mask)
-    artifact_field = err - consistency_error
+    observed_subspace_error = project(err, mask)
+    artifact_field = err - observed_subspace_error
     recon_nullspace = recon_c - project(recon_c, mask)
     truth_nullspace = truth_c - project(truth_c, mask)
 
@@ -96,12 +159,12 @@ def decompose_error(
     truth_norm = torch.linalg.vector_norm(truth_c).item()
     return ErrorDecomposition(
         total_error=err.abs(),
-        consistency_error=consistency_error,
+        consistency_error=observed_subspace_error,
         artifact_field=artifact_field,
         recon_nullspace=recon_nullspace,
         truth_nullspace=truth_nullspace,
         total_error_norm=torch.linalg.vector_norm(err).item(),
-        consistency_norm=torch.linalg.vector_norm(consistency_error).item(),
+        consistency_norm=torch.linalg.vector_norm(observed_subspace_error).item(),
         artifact_norm=torch.linalg.vector_norm(artifact_field).item(),
         recon_nullspace_norm=recon_nullspace_norm,
         truth_nullspace_norm=torch.linalg.vector_norm(truth_nullspace).item(),
@@ -280,11 +343,68 @@ def subspace_nullspace_leakage(
     return lost / max(total, 1e-30)
 
 
-def expected_zero_filled_mse(mask: np.ndarray, mean_power: np.ndarray) -> float:
+def expected_zero_filled_noise_mse(mask: np.ndarray, noise_std: float) -> float:
+    """Expected per-pixel zero-filled MSE contributed by measurement noise.
+
+    ``noise_std`` follows :func:`mrsim.recon.simulate_measurements`, namely
+    ``E[|n_k|^2] = noise_std^2``.  With an orthonormal FFT the expected image
+    error energy is ``noise_std^2 * sum(|mask|^2)``.
+    """
+    if not np.isfinite(noise_std) or noise_std < 0.0:
+        raise ValueError("noise_std must be finite and non-negative")
+    mask_array = np.asarray(mask)
+    if mask_array.size == 0:
+        raise ValueError("mask must be non-empty")
+    return float(noise_std**2 * np.sum(np.abs(mask_array) ** 2) / mask_array.size)
+
+
+def prior_observable_energy_fraction(
+    mask: np.ndarray, mean_power: np.ndarray
+) -> float:
+    """Training-prior estimate of ``E||P x||^2 / E||x||^2``.
+
+    ``mean_power`` must be the frequency-domain second moment ``E|X_k|^2``.
+    This is a ratio of pooled energies, not one minus the unweighted mean of
+    per-image oracle ratios. It is prior-derived and is not a
+    distribution-free property of the operator.
+    """
+    mask_array = np.asarray(mask, dtype=np.float64)
+    power = np.asarray(mean_power, dtype=np.float64)
+    if mask_array.shape != power.shape:
+        raise ValueError(
+            f"mask shape {mask_array.shape} does not match mean_power shape {power.shape}"
+        )
+    if not np.isin(mask_array, (0.0, 1.0)).all():
+        raise ValueError("mask must be binary")
+    if not np.isfinite(power).all() or np.any(power < 0.0):
+        raise ValueError("mean_power must contain finite, non-negative values")
+    total = float(power.sum())
+    if total <= 0.0:
+        return 0.0
+    return float((mask_array * power).sum() / total)
+
+
+def expected_zero_filled_mse(
+    mask: np.ndarray,
+    mean_power: np.ndarray,
+    *,
+    noise_std: float = 0.0,
+) -> float:
     """Predicted per-pixel zero-filled MSE from a mean frequency-domain power spectrum.
 
     With the orthonormal FFT, the zero-filled error energy equals the spectral
     energy at unsampled locations (Parseval), so the expected per-pixel MSE is
-    the unsampled mean power divided by the number of pixels.
+    the unsampled mean power divided by the number of pixels.  When
+    ``noise_std`` is nonzero, the sampled-coefficient noise contribution is
+    added using :func:`expected_zero_filled_noise_mse`.
     """
-    return float(((1.0 - mask) * mean_power).sum() / mask.size)
+    mask_array = np.asarray(mask, dtype=np.float64)
+    power = np.asarray(mean_power, dtype=np.float64)
+    if mask_array.shape != power.shape:
+        raise ValueError(
+            f"mask shape {mask_array.shape} does not match mean_power shape {power.shape}"
+        )
+    if not np.isfinite(power).all() or np.any(power < 0.0):
+        raise ValueError("mean_power must contain finite, non-negative values")
+    signal_term = float(((1.0 - mask_array) * power).sum() / mask_array.size)
+    return signal_term + expected_zero_filled_noise_mse(mask_array, noise_std)

@@ -1,6 +1,9 @@
-"""The repo-wide convention is that every mask meets the budget exactly and
-forces the center. The parameterized family multiplies the number of masks, so
-the invariant is checked across the whole family and across budgets."""
+"""Mask families respect their acquisition units and force the center.
+
+Point masks meet a point budget exactly. Cartesian masks acquire only complete
+columns and therefore use the largest whole-line budget not exceeding the
+requested number of points.
+"""
 
 import numpy as np
 import pytest
@@ -10,6 +13,16 @@ from mrsim import experiment
 from mrsim.data import generate_dataset
 
 SIZE = 16
+LINE_MASK_NAMES = {
+    "equispaced_lines",
+    "line_aopt",
+    "spectrum_energy_greedy",
+    "line_subspace_leakage",
+}
+
+
+def _is_line_mask(name: str) -> bool:
+    return name in LINE_MASK_NAMES or name.startswith("variable_density_lines_")
 
 
 def _cfg(fraction: float) -> dict:
@@ -53,7 +66,10 @@ def test_family_meets_budget_and_center_at_every_acceleration(fraction, train_im
     for name, mask in family.items():
         assert mask.shape == shape, name
         assert set(np.unique(mask)).issubset({0.0, 1.0}), name
-        assert int(mask.sum()) == n_samples, f"{name} missed the budget"
+        expected = (n_samples // SIZE) * SIZE if _is_line_mask(name) else n_samples
+        assert int(mask.sum()) == expected, f"{name} missed its acquisition-unit budget"
+        if _is_line_mask(name):
+            assert np.all(np.isin(mask.sum(axis=0), [0, SIZE])), name
 
 
 def test_family_names_are_unique_and_varied(train_images):

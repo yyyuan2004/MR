@@ -20,21 +20,37 @@ def ifft2c(k: torch.Tensor) -> torch.Tensor:
     return torch.fft.fftshift(x, dim=(-2, -1))
 
 
-def as_mask_tensor(mask: np.ndarray | torch.Tensor) -> torch.Tensor:
-    """Convert a mask to a float32 tensor suitable for broadcasting."""
+def as_mask_tensor(
+    mask: np.ndarray | torch.Tensor,
+    *,
+    like: torch.Tensor | None = None,
+) -> torch.Tensor:
+    """Convert a mask to a real tensor suitable for broadcasting.
+
+    When ``like`` is supplied, the mask follows its device and real dtype.  In
+    particular, a complex64/complex128 reference produces a float32/float64
+    mask on the same device.  Calls without ``like`` retain the historical
+    CPU/float32 behaviour.
+    """
     if isinstance(mask, np.ndarray):
         mask = torch.from_numpy(np.ascontiguousarray(mask))
-    return mask.to(torch.float32)
+    if like is None:
+        return mask.to(torch.float32)
+    dtype = like.real.dtype if like.is_complex() else like.dtype
+    if not dtype.is_floating_point:
+        dtype = torch.float32
+    return mask.to(device=like.device, dtype=dtype)
 
 
 def forward_op(x: torch.Tensor, mask: np.ndarray | torch.Tensor) -> torch.Tensor:
     """Forward operator A = M F: masked frequency-domain coefficients of a signal."""
-    return as_mask_tensor(mask) * fft2c(x)
+    k = fft2c(x)
+    return as_mask_tensor(mask, like=k) * k
 
 
 def adjoint_op(y: torch.Tensor, mask: np.ndarray | torch.Tensor) -> torch.Tensor:
     """Adjoint operator A^H = F^H M applied to frequency-domain data."""
-    return ifft2c(as_mask_tensor(mask) * y)
+    return ifft2c(as_mask_tensor(mask, like=y) * y)
 
 
 def projector(x: torch.Tensor, mask: np.ndarray | torch.Tensor) -> torch.Tensor:
@@ -43,4 +59,5 @@ def projector(x: torch.Tensor, mask: np.ndarray | torch.Tensor) -> torch.Tensor:
     F is unitary and M is a diagonal 0/1 selection, so P is an orthogonal
     projection: Hermitian (P^H = P) and idempotent (P^2 = P).
     """
-    return ifft2c(as_mask_tensor(mask) * fft2c(x))
+    k = fft2c(x)
+    return ifft2c(as_mask_tensor(mask, like=k) * k)

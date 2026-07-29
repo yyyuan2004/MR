@@ -1,104 +1,131 @@
 # MR
 
-Measurement-mask design and comparison toolkit for undersampled
-frequency-domain inverse problems. Generates synthetic test signals, builds
-frequency-domain measurement masks (random, structured, and
-greedy/data-driven), reconstructs with linear and iterative methods, and
-compares masks with reconstruction and artifact metrics, including an
-observed-subspace / null-space error decomposition.
+Small, CPU-oriented experiments for comparing undersampled Fourier masks and
+reconstruction errors. The default path generates synthetic images, applies an
+ideal single-coil Cartesian Fourier operator, reconstructs with fixed classical
+methods, and records an observed-subspace / null-space error decomposition.
+
+## Scope
+
+The checked-in default experiment is deliberately narrow:
+
+- train, validation, and test images are independent draws from the same
+  synthetic ellipse generator;
+- the forward model is an ideal centered orthonormal 2-D Fourier transform with
+  a binary mask and circular complex Gaussian k-space noise;
+- there are no coil sensitivities, non-Cartesian trajectories, calibration
+  errors, real scanner data, CT data, or distribution shift;
+- the default comparison contains only stable, non-learned point and Cartesian
+  line baselines.
+
+Results from this configuration are synthetic, in-distribution sanity checks.
+They do not establish clinical performance, robustness under prior shift,
+regime-transition claims, or confirmatory inference.
 
 ## Installation
 
-Requires Python 3.12+ (runs on 3.11 as well).
+Python 3.11 or newer is required. CPU-only PyTorch is sufficient:
 
 ```bash
 python -m venv .venv
-source .venv/bin/activate
-pip install -r requirements.txt
+python -m pip install --upgrade pip
+python -m pip install torch --index-url https://download.pytorch.org/whl/cpu
+python -m pip install -e ".[dev]"
 ```
 
-CPU-only PyTorch is sufficient:
-
-```bash
-pip install torch --index-url https://download.pytorch.org/whl/cpu
-```
+`requirements.txt` contains runtime dependencies only. The editable install
+with the `dev` extra also installs pytest.
 
 ## Quickstart
 
-Run the default experiment (200 synthetic 64x64 images, 11 mask types,
-zero-filled, Wiener, and wavelet-ISTA reconstruction) from the repository root:
+Run the default CPU experiment:
 
 ```bash
 python scripts/07_compare_all_masks.py --config configs/default.yaml
 ```
 
-Outputs land in `runs/default/`. Run the tests with:
+The shipped default uses 60 synthetic 64x64 images split into 36 train, 12
+validation, and 12 test images. It compares five baselines:
+`uniform_random`, `variable_density`, `multilevel_random`,
+`equispaced_lines`, and `variable_density_lines`.
+
+For a minimal wiring check, use:
 
 ```bash
-pytest
+python scripts/07_compare_all_masks.py --config configs/smoke.yaml
 ```
+
+The smoke config uses eight 32x32 images and two masks. It is intended for CI,
+not for scientific conclusions.
+
+Run unit tests with:
+
+```bash
+pytest -q
+```
+
+GitHub Actions runs the tests and the smoke experiment on Ubuntu with Python
+3.11 and CPU PyTorch.
+
+## Reading the reported quantities
+
+The output mixes quantities with different information requirements. Keep
+these categories separate:
+
+- **Operator/measurement-observable:** the mask, sampling budget, PSF, measured
+  data, and a measurement residual computed from a reconstruction.
+- **Prior-derived design diagnostics:** `mask_score`,
+  `prior_observable_energy_fraction`, `weighted_max_sidelobe`, and
+  `wavelet_leakage`. They are computable before seeing test truth, but depend
+  on the training distribution or a chosen representation and are not
+  distribution-free certificates.
+- **Oracle evaluation quantities:** `complex_mse`, `magnitude_mse`, PSNR,
+  SSIM, NRMSE, `oracle_unsampled_energy_ratio`,
+  `oracle_nullspace_error_norm`,
+  `oracle_observed_subspace_error_norm`, and
+  `oracle_truth_nullspace_norm`. These use the ground-truth test image, so
+  they are unavailable for certifying an unknown test sample.
+
+`measurement_residual_norm = ||y - A recon||` is reported separately and is
+directly computable from a measurement and reconstruction. It is not the same
+as the oracle observed-subspace error.
+
+## Point masks and line masks
+
+Point masks select arbitrary individual Fourier coefficients. Line masks
+select Cartesian columns. These are different acquisition constraints and
+should be summarized in separate strata rather than treated as interchangeable
+designs.
+
+Every line-mask helper emits only complete columns. For a point budget that is
+not divisible by image height, the remainder is left unspent and the manifest
+records the actual sample count.
+
+## Output layout
+
+Every config is fingerprinted. Outputs are written under:
+
+```text
+runs/<experiment_name>/<config-hash>/
+```
+
+Typical contents include config snapshots, masks, PSFs, per-image metrics,
+acquisition-stratified summary plots, reconstruction grids, and oracle error maps. See
+[`docs/usage.md`](docs/usage.md) for the complete layout and configuration
+reference.
 
 ## Repository structure
 
-```
-configs/            YAML experiment configs
-mrsim/              library code
-  config.py         config loading, run dirs, seeding
-  data.py           synthetic test signal generation
-  fft_ops.py        centered orthonormal FFT, forward/adjoint, projector
-  masks.py          baseline mask generators, point- and line-wise (exact budgets)
-  greedy.py         greedy selection: A-optimal, PSF-penalized, data-driven,
-                    line-wise, wavelet-leakage, reconstruction-in-the-loop
-  subspace.py       subspace / generator-manifold priors (SVD basis, Jacobian basis)
-  operators.py      pluggable measurement operators (Fourier, pixel inpainting)
-  progress.py       dependency-free progress reporting
-  recon.py          measurement simulation; zero-filled, Wiener, wavelet-ISTA reconstruction
-  metrics.py        PSNR / SSIM / NRMSE / MSE
-  artifacts.py      decomposition, artifact maps, PSF metrics, mask scores
-  viz.py            image grids, PSF plots, scatter plots
-  unet.py           optional compact U-Net (not used by the default pipeline)
-  experiment.py     shared plumbing for the numbered scripts
-scripts/            numbered experiment scripts (01-13), run from repo root
-tests/              pytest suite
-docs/               usage, experiment descriptions, reproduction log template
-runs/               experiment outputs (gitignored)
+```text
+configs/            default and CI smoke configurations
+mrsim/              simulation, masks, reconstruction, metrics, and plotting
+scripts/            core scripts 01-07 and experimental scripts 08-12
+tests/              unit tests
+docs/               usage, interpretation, and reproduction guidance
+runs/               generated outputs (gitignored)
 ```
 
-## Running synthetic experiments
-
-Scripts can be run individually; each loads a YAML config, writes outputs under
-`runs/<experiment_name>/`, and saves a JSON snapshot of the config it used:
-
-```bash
-python scripts/01_generate_synthetic_data.py --config configs/default.yaml
-python scripts/02_make_baseline_masks.py     --config configs/default.yaml
-python scripts/03_reconstruct_and_evaluate.py --config configs/default.yaml
-python scripts/04_aopt_greedy_mask.py        --config configs/default.yaml
-python scripts/05_artifact_aware_mask_search.py --config configs/default.yaml
-python scripts/06_greedy_data_driven_mask.py --config configs/default.yaml
-python scripts/07_compare_all_masks.py       --config configs/default.yaml
-```
-
-See `docs/usage.md` for the config reference and `docs/experiments.md` for what
-each mask and score means.
-
-## Comparing sampling masks
-
-`scripts/07_compare_all_masks.py` builds every mask listed under `mask.types`
-in the config, reconstructs the test split with zero-filled, Wiener, and
-wavelet-ISTA methods,
-and writes:
-
-- `runs/<exp>/metrics/compare_metrics.csv` — per-image metrics per mask/method
-- `runs/<exp>/metrics/summary.csv` — aggregated table with PSF metrics and mask scores
-- `runs/<exp>/plots/score_vs_error.png` — predicted mask score vs measured error
-
-## Inspecting artifact maps
-
-Artifact maps are the pointwise magnitude of the complex reconstruction error
-`|recon - truth|`. The comparison script saves grids of five representative
-test images (spread across the difficulty range) per mask and method under:
-
-- `runs/<exp>/artifact_maps/<mask>_<method>.png`
-- matching reconstructions in `runs/<exp>/recon/<mask>_<method>.png`
-- PSF plots per mask in `runs/<exp>/psf/<mask>_psf.png`
+Scripts 08-12 cover subspace, LOUPE-style, learned post-processing, and broad
+mask-family sweeps. They are experimental opt-in studies, are not part of the
+default evidence, and require separate validation before being used for paper
+claims.

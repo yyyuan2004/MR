@@ -11,7 +11,8 @@ from mrsim.greedy import (
 from mrsim.masks import jaccard, multilevel_random_mask, variable_density_lines_mask
 
 SHAPE = (16, 16)
-BUDGETS = [1, 16, 37, 100, 128, 256]
+POINT_BUDGETS = [1, 16, 37, 100, 128, 256]
+LINE_BUDGETS = [16, 32, 96, 128, 256]
 
 
 def _check(mask: np.ndarray, n_samples: int) -> None:
@@ -24,30 +25,31 @@ def _images(n: int = 6) -> np.ndarray:
     return np.random.default_rng(0).random((n, *SHAPE))
 
 
-@pytest.mark.parametrize("n_samples", BUDGETS)
+@pytest.mark.parametrize("n_samples", LINE_BUDGETS)
 def test_variable_density_lines_budget(n_samples):
     mask = variable_density_lines_mask(SHAPE, n_samples, np.random.default_rng(0))
     _check(mask, n_samples)
+    assert np.all(np.isin(mask.sum(axis=0), [0, SHAPE[0]]))
 
 
-@pytest.mark.parametrize("n_samples", BUDGETS)
+@pytest.mark.parametrize("n_samples", POINT_BUDGETS)
 def test_multilevel_random_budget(n_samples):
     mask = multilevel_random_mask(SHAPE, n_samples, np.random.default_rng(0))
     _check(mask, n_samples)
 
 
-@pytest.mark.parametrize("n_samples", [16, 37, 100])
+@pytest.mark.parametrize("n_samples", [16, 32, 96])
 def test_line_aopt_budget(n_samples):
     spectrum = np.random.default_rng(1).random(SHAPE) + 0.1
     _check(greedy_line_a_optimal(spectrum, n_samples), n_samples)
 
 
-@pytest.mark.parametrize("n_samples", [16, 37, 100])
+@pytest.mark.parametrize("n_samples", [16, 32, 96])
 def test_spectrum_energy_lines_budget(n_samples):
     _check(greedy_lines_spectrum_energy(_images(), n_samples), n_samples)
 
 
-@pytest.mark.parametrize("n_samples", [16, 37, 100])
+@pytest.mark.parametrize("n_samples", [16, 32, 96])
 def test_subspace_leakage_lines_budget(n_samples):
     mask = greedy_lines_subspace_leakage(_images(), n_samples, wavelet="db2", levels=2)
     _check(mask, n_samples)

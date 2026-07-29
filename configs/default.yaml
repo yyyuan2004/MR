@@ -1,101 +1,93 @@
-# Default synthetic experiment configuration.
+# CPU-oriented baseline configuration for the in-distribution synthetic study.
 experiment_name: default
 seed: 0
 
 n_workers: 1               # >1 builds the mask family on a thread pool (A3)
 
 data:
-  source: synthetic        # synthetic | file
-  # path: runs/data/dataset.pt   # required when source: file
-  # NOTE: the split is sequential and unshuffled. An external stack must be
-  # grouped by subject so all correlated slices land in one contiguous block;
-  # interleaved stacking leaks the test split into the fitted prior.
-  n_images: 220
+  n_images: 60
   image_size: 64
-  n_train: 120
-  n_val: 20                # validation split, used to tune the ISTA threshold
-  n_test: 80
+  n_train: 36
+  n_val: 12
+  n_test: 12
   phantom: ellipses        # ellipses | shepp_logan
   min_ellipses: 3
   max_ellipses: 8
 
 measurement:
-  noise_std: 0.005         # std of complex Gaussian frequency-domain noise
+  # Std of circular complex Gaussian noise in single-coil Fourier space.
+  noise_std: 0.005
 
 mask:
   sampling_fraction: 0.25
-  center_fraction: 0.02    # fraction of the budget forced onto the frequency-domain center
+  center_fraction: 0.02    # fraction of the point budget reserved at k-space center
   variable_density_decay: 3.0
-  lines:                   # shared by all Cartesian column (line-wise) masks
-    n_center_lines: 2      # columns around the center that are always taken
-    decay: 2.0             # density decay for variable_density_lines
+  lines:
+    n_center_lines: 2
+    decay: 2.0
   multilevel:
-    n_levels: 4            # dyadic radial annuli
-    decay: 1.5             # per-level density falloff 2^(-decay * level)
-  types:                   # masks compared by scripts/07_compare_all_masks.py
+    n_levels: 4
+    decay: 1.5
+  # Stable, non-learned baselines used by the default comparison. Advanced
+  # greedy, subspace, and learned designs are opt-in experimental scripts.
+  types:
     - uniform_random
     - variable_density
+    - multilevel_random
     - equispaced_lines
     - variable_density_lines
-    - multilevel_random
-    - aopt_greedy
-    - psf_penalized_aopt_greedy
-    - line_aopt
-    - line_subspace_leakage
-    - spectrum_energy_greedy
-    - recon_in_loop_greedy
 
 greedy:
-  # Invariant: the selection criterion's noise variance defaults to
-  # measurement.noise_std ** 2 (the simulated noise). Set greedy.noise_var
-  # here only to deliberately override that single source of truth.
-  beta: 1.0                # weight of the (spectrum-weighted) PSF sidelobe penalty
-  beta_sweep: [0.0, 0.5, 1.0, 2.0, 4.0]   # used by scripts/05 --beta-sweep
-  n_candidates: 32         # hybrid candidate pool size per PSF-penalized step
-  recon_in_loop:           # parameters of the reconstruction-in-the-loop selector
-    n_candidate_lines: 12
-    batch_size: 8
-    ista_iters: 6
+  # Defaults to measurement.noise_std ** 2 unless explicitly overridden.
+  beta: 1.0
+  beta_sweep: [0.0, 1.0, 2.0]
+  n_candidates: 8
+  recon_in_loop:
+    n_candidate_lines: 6
+    batch_size: 4
+    ista_iters: 3
 
+# Experimental settings below are not exercised by the default comparison.
 subspace:
-  d: 32                    # subspace dimension fitted on the train split
-  beta: 0.0                # sidelobe penalty in subspace A-opt (0 = pure A-optimal)
-  ridge: 1.0e-6            # Tikhonov term keeping the design Gram invertible
-  lam: null                # subspace recon regularization; null -> measurement.noise_std ** 2
+  d: 16
+  beta: 0.0
+  ridge: 1.0e-6          # numerical floor for the posterior precision
+  lam: null              # null -> measurement.noise_std ** 2, for design and recon
   generative:
-    steps: 200
+    steps: 50
     lr: 0.05
 
-unet_post:                 # learned post-processor (scripts/12_train_unet.py)
-  mask_type: variable_density   # fixed mask the network is trained under
-  epochs: 60
-  batch_size: 8
+unet_post:
+  mask_type: variable_density
+  epochs: 10
+  batch_size: 4
   lr: 0.001
-  base_channels: 16
+  base_channels: 8
 
 budget_sweep:
-  # Acceleration factors to sweep; sampling_fraction = 1 / acceleration.
-  accelerations: [4, 8, 12]
+  accelerations: [4, 8]
 
 loupe:
-  epochs: 30
-  batch_size: 8
+  epochs: 10
+  batch_size: 4
   lr: 0.001
-  prob_slope: 5.0          # sigmoid slope mapping logits to probabilities
-  mask_slope: 12.0         # sigmoid slope of the relaxed binarization
-  base_channels: 16
+  prob_slope: 5.0
+  mask_slope: 12.0
+  base_channels: 8
 
 recon:
-  ridge_lambda: 0.05       # scalar fallback only (no spectrum available)
+  ridge_lambda: 0.05
   wavelet_ista:
-    threshold: 0.02        # fixed fallback; also the "fixed" comparison arm
-    # Grid searched per mask on the validation split when tuning is enabled.
-    # A single global threshold confounds mask comparison — see docs.
-    threshold_grid: [0.0025, 0.005, 0.01, 0.02, 0.04, 0.08]
-    n_iters: 50
+    threshold: 0.02
+    n_iters: 15
     wavelet: db4
     levels: 3
-    final_dc: true
+    # With noisy measurements, exact replacement would re-inject the observed
+    # noise. Set true only for a deliberately hard data-consistency projection.
+    final_dc: false
 
 outputs:
-  n_examples: 5
+  n_examples: 3
+
+experimental:
+  include_unet_in_comparisons: false

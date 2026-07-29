@@ -1,6 +1,5 @@
 #!/usr/bin/env python3
-"""Build the baseline masks (uniform random, variable density, equispaced lines)
-and evaluate them on the test split."""
+"""Build the stable point and full-line baselines and evaluate the test split."""
 
 from __future__ import annotations
 
@@ -13,7 +12,13 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 from mrsim import experiment
 from mrsim.config import load_config, run_dir, save_config_snapshot, seed_everything
 
-BASELINES = ["uniform_random", "variable_density", "equispaced_lines"]
+BASELINES = [
+    "uniform_random",
+    "variable_density",
+    "multilevel_random",
+    "equispaced_lines",
+    "variable_density_lines",
+]
 
 
 def main() -> None:
@@ -24,15 +29,21 @@ def main() -> None:
     cfg = load_config(args.config)
     rng = seed_everything(int(cfg["seed"]))
     run = run_dir(cfg)
-    save_config_snapshot(cfg, run, "02_make_baseline_masks")
+    save_config_snapshot(cfg, run, "02_make_baseline_masks", cli_args=vars(args))
 
     images = experiment.load_or_generate_dataset(cfg, run)
-    train, test = experiment.train_test_split(images, cfg)
+    train, _, test = experiment.train_validation_test_split(images, cfg)
 
     mask_dict = experiment.build_masks(BASELINES, cfg, train, rng)
-    spectrum = experiment.mean_power_spectrum(train)
+    prior_mean, prior_variance, _ = experiment.frequency_prior_statistics(train)
     frame = experiment.evaluate_masks(
-        mask_dict, test, cfg, run, prefix="baselines", spectrum=spectrum
+        mask_dict,
+        test,
+        cfg,
+        run,
+        prefix="baselines",
+        spectrum=prior_variance,
+        prior_mean=prior_mean,
     )
 
     summary = frame.groupby(["mask", "method"])[["psnr", "ssim", "nrmse"]].mean()

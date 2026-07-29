@@ -3,7 +3,11 @@ import torch
 
 from mrsim.artifacts import decompose_error
 from mrsim.data import random_ellipse_phantom
-from mrsim.experiment import greedy_noise_var, mean_power_spectrum
+from mrsim.experiment import (
+    greedy_noise_var,
+    mean_power_spectrum,
+    subspace_regularization,
+)
 from mrsim.masks import variable_density_mask
 from mrsim.recon import ridge, simulate_measurements, zero_filled
 
@@ -55,3 +59,14 @@ def test_greedy_noise_var_matches_measurement_noise():
     cfg_override = {"measurement": {"noise_std": 0.005}, "greedy": {"noise_var": 0.5}}
     assert greedy_noise_var(cfg_override) == 0.5
     assert greedy_noise_var({}) == 0.0
+
+
+def test_subspace_regularization_matches_measurement_noise_with_floor():
+    cfg = {
+        "measurement": {"noise_std": 0.01},
+        "greedy": {"noise_var": 99.0},
+        "subspace": {"ridge": 1e-6, "lam": None},
+    }
+    assert subspace_regularization(cfg) == 0.01**2
+    cfg["subspace"]["lam"] = 0.2
+    assert subspace_regularization(cfg) == 0.2
