@@ -2,6 +2,8 @@
 experiment_name: default
 seed: 0
 
+n_workers: 1               # >1 builds the mask family on a thread pool (A3)
+
 data:
   n_images: 60
   image_size: 64
