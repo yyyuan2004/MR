@@ -4,7 +4,9 @@
 
 `configs/default.yaml` defines the default experiment:
 
-- 200 synthetic 64x64 random-ellipse test signals; first 120 train, next 80 test.
+- 220 synthetic 64x64 random-ellipse test signals, split sequentially: first
+  120 train, next 20 validation (used only to tune the ISTA threshold), next
+  80 test. Set `data.n_val: 0` to recover the earlier two-way split.
 - Measurement budget: 25% of the frequency domain (1024 of 4096 locations),
   with 2% of the budget forced onto the frequency-domain center.
 - Eleven masks: point-wise `uniform_random`, `variable_density`,
@@ -18,7 +20,9 @@
 - Reconstruction: zero-filled (`F^H y`), Wiener (per-coefficient shrinkage
   `s_k / (s_k + noise_var)` with the spectrum estimated on the train split
   only), and wavelet ISTA (iterative soft-thresholding in a wavelet basis
-  with a final data-consistency step).
+  with a final data-consistency step). With `--tune-ista` the ISTA threshold is
+  selected per mask on the validation split and the fixed-threshold arm is
+  reported alongside it as `wavelet_ista_fixed`.
 - Outputs: per-image metrics CSV, aggregated summary CSV, mask/PSF images,
   reconstruction and artifact-map grids for 5 representative test images,
   and a scatter plot of mask score vs measured reconstruction error.
