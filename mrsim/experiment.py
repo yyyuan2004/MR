@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+import threading
 import time
 import warnings
 from concurrent.futures import ThreadPoolExecutor, as_completed
@@ -30,14 +31,49 @@ def dataset_path(run: Path) -> Path:
 
 def _dataset_metadata(cfg: dict[str, Any]) -> dict[str, Any]:
     d = cfg["data"]
-    return {
+    source = str(d.get("source", "synthetic"))
+    metadata = {
+        "source": source,
         "seed": int(cfg["seed"]),
         "n_images": int(d["n_images"]),
         "image_size": int(d["image_size"]),
-        "phantom": str(d.get("phantom", "ellipses")),
-        "min_ellipses": int(d.get("min_ellipses", 3)),
-        "max_ellipses": int(d.get("max_ellipses", 8)),
     }
+    if source == "synthetic":
+        metadata.update(
+            {
+                "phantom": str(d.get("phantom", "ellipses")),
+                "min_ellipses": int(d.get("min_ellipses", 3)),
+                "max_ellipses": int(d.get("max_ellipses", 8)),
+            }
+        )
+        return metadata
+
+    source_path = Path(d["path"])
+    metadata.update(
+        {
+            "path": str(source_path.resolve()),
+            "sha256": _file_sha256(source_path),
+        }
+    )
+    return metadata
+
+
+def _file_sha256(path: Path) -> str:
+    digest = hashlib.sha256()
+    with path.open("rb") as f:
+        for chunk in iter(lambda: f.read(1024 * 1024), b""):
+            digest.update(chunk)
+    return digest.hexdigest()
+
+
+def _can_refresh_dataset_cache(
+    cached_metadata: dict[str, Any], expected_metadata: dict[str, Any]
+) -> bool:
+    cached_source = str(cached_metadata.get("source", "synthetic"))
+    expected_source = str(expected_metadata.get("source", "synthetic"))
+    if cached_source != expected_source:
+        return True
+    return expected_source != "synthetic"
 
 
 def load_or_generate_dataset(cfg: dict[str, Any], run: Path, force: bool = False) -> torch.Tensor:
@@ -50,12 +86,14 @@ def load_or_generate_dataset(cfg: dict[str, Any], run: Path, force: bool = False
             raise ValueError(
                 f"{path} is a legacy dataset cache without metadata; regenerate it with script 01"
             )
-        if payload["metadata"] != expected_metadata:
+        cached_metadata = payload["metadata"]
+        if cached_metadata == expected_metadata:
+            return payload["images"]
+        if not _can_refresh_dataset_cache(cached_metadata, expected_metadata):
             raise ValueError(
                 f"{path} was generated from a different data configuration; "
                 "use the matching config-hash run or regenerate it"
             )
-        return payload["images"]
     d = cfg["data"]
     if str(d.get("source", "synthetic")) == "synthetic":
         images = data.generate_dataset(
@@ -99,6 +137,9 @@ def train_test_split(images: torch.Tensor, cfg: dict[str, Any]) -> tuple[torch.T
     """Compatibility wrapper returning train and the held-out test split."""
     train, _, test = train_validation_test_split(images, cfg)
     return train, test
+
+
+train_val_test_split = train_validation_test_split
 
 
 # ---------------------------------------------------------------------------
@@ -608,6 +649,7 @@ def reconstruct_all(
     gen_model=None,
     gen_z0: torch.Tensor | None = None,
     unet_model=None,
+    ista_threshold: float | None = None,
     return_measurements: bool = False,
 ) -> dict[str, torch.Tensor] | tuple[dict[str, torch.Tensor], torch.Tensor]:
     """Simulate measurements and reconstruct with every configured method.
@@ -844,6 +886,9 @@ def evaluate_masks(
     Returns the per-image metrics DataFrame (also written to
     runs/<exp>/metrics/<prefix>_metrics.csv).
     """
+    tune_ista = val_images is not None and cfg.get("recon", {}).get("wavelet_ista")
+    if tune_ista and val_images.shape[0] == 0:
+        raise ValueError("ISTA threshold tuning requires a non-empty validation split")
     n_examples = int(cfg.get("outputs", {}).get("n_examples", 5))
     noise_std = float(cfg.get("measurement", {}).get("noise_std", 0.0))
     common_noise = None
@@ -865,6 +910,7 @@ def evaluate_masks(
 
     all_rows: list[dict[str, Any]] = []
     psf_rows: list[dict[str, float]] = []
+    ista_threshold_tables: list[pd.DataFrame] = []
     for name in track(mask_dict, total=len(mask_dict), label=f"evaluate[{prefix}]"):
         mask = np.asarray(mask_dict[name])
         if tuple(mask.shape) != tuple(test_images.shape[-2:]):
@@ -873,6 +919,17 @@ def evaluate_masks(
                 f"shape {tuple(test_images.shape[-2:])}"
             )
         psf_rows.append(save_mask_bundle(mask, name, run))
+        selected_ista_threshold = None
+        if tune_ista:
+            selected_ista_threshold, threshold_table = tune_ista_threshold(
+                val_images, mask, cfg
+            )
+            threshold_table = threshold_table.copy()
+            threshold_table.insert(0, "mask", name)
+            threshold_table["selected"] = (
+                threshold_table["threshold"] == selected_ista_threshold
+            )
+            ista_threshold_tables.append(threshold_table)
         reconstructed = reconstruct_all(
             test_images, mask, cfg,
             noise=common_noise,
@@ -882,6 +939,7 @@ def evaluate_masks(
             subspace_mean=subspace_mean,
             subspace_variances=subspace_variances,
             unet_model=unet_model,
+            ista_threshold=selected_ista_threshold,
             return_measurements=True,
         )
         recons, measurements = reconstructed
@@ -902,6 +960,10 @@ def evaluate_masks(
     _ensure_dir(run / "metrics")
     frame.to_csv(run / "metrics" / f"{prefix}_metrics.csv", index=False)
     pd.DataFrame(psf_rows).to_csv(run / "metrics" / f"{prefix}_psf_metrics.csv", index=False)
+    if ista_threshold_tables:
+        pd.concat(ista_threshold_tables, ignore_index=True).to_csv(
+            run / "metrics" / f"{prefix}_ista_thresholds.csv", index=False
+        )
     return frame
 
 

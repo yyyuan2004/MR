@@ -52,7 +52,7 @@ def main() -> None:
     save_config_snapshot(cfg, run, "07_compare_all_masks", cli_args=vars(args))
 
     images = experiment.load_or_generate_dataset(cfg, run)
-    train, _, test = experiment.train_validation_test_split(images, cfg)
+    train, validation, test = experiment.train_validation_test_split(images, cfg)
     mask_names = list(cfg["mask"]["types"])
     print(f"building masks: {', '.join(mask_names)}")
     mask_dict = experiment.build_masks(mask_names, cfg, train, rng)
@@ -65,9 +65,12 @@ def main() -> None:
     unet = experiment.load_unet(run, cfg=cfg) if include_unet else None
     if unet is not None:
         print("including experimental U-Net post-processor as 'unet_post'")
+    if args.tune_ista and validation.shape[0] == 0:
+        raise ValueError("--tune-ista requires data.n_val > 0")
     frame = experiment.evaluate_masks(
         mask_dict, test, cfg, run, prefix="compare",
         spectrum=prior_variance, prior_mean=prior_mean, unet_model=unet,
+        val_images=validation if args.tune_ista else None,
     )
 
     scores = {
