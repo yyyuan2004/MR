@@ -1,3 +1,5 @@
+[![Ask DeepWiki](https://deepwiki.com/badge.svg)](https://deepwiki.com/yyyuan2004/MR)
+
 # MR
 
 Small, CPU-oriented experiments for comparing undersampled Fourier masks and
