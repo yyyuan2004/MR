@@ -25,7 +25,7 @@ import pandas as pd
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
-from mrsim import artifacts, experiment, masks
+from mrsim import artifacts, experiment, masks, viz
 from mrsim.config import load_config, run_dir, save_config_snapshot, seed_everything
 
 PREDICTORS = [
@@ -103,6 +103,15 @@ def main() -> None:
         print(f"\n=== acceleration {acceleration:g}x  ({n_samples} of {shape[0] * shape[1]}) ===")
 
         mask_dict = experiment.build_mask_family(budget_cfg, train)
+        # Frequency- and wavelet-coverage diagnostics per budget, on a subset
+        # spread across the family so the overlays stay readable.
+        subset = viz.representative_subset(mask_dict, train_power, n=8)
+        viz.plot_radial_coverage(
+            subset, train_power, sub_run / "plots" / "radial_coverage.png"
+        )
+        viz.plot_subband_leakage(
+            subset, mass, energies, sub_run / "plots" / "subband_leakage.png"
+        )
         frame = experiment.evaluate_masks(
             mask_dict, test, budget_cfg, sub_run, prefix=f"budget_{acceleration:g}x",
             spectrum=prior_variance,

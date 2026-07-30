@@ -223,6 +223,230 @@ def plot_score_vs_error(
     plt.close(fig)
 
 
+def representative_subset(
+    masks_dict: dict[str, np.ndarray],
+    train_power: np.ndarray,
+    n: int = 8,
+) -> dict[str, np.ndarray]:
+    """Up to n masks spread across the observed-energy range.
+
+    Overlay plots become unreadable past ~8 lines; picking quantiles of the
+    observed training-energy fraction keeps both extremes and the middle of
+    the family visible, deterministically.
+    """
+    if len(masks_dict) <= n:
+        return dict(masks_dict)
+    total = float(train_power.sum())
+    ordered = sorted(
+        masks_dict, key=lambda name: float((masks_dict[name] * train_power).sum()) / total
+    )
+    positions = np.unique(np.linspace(0, len(ordered) - 1, n).astype(int))
+    return {ordered[p]: masks_dict[ordered[p]] for p in positions}
+
+
+def plot_radial_coverage(
+    masks_dict: dict[str, np.ndarray],
+    train_power: np.ndarray,
+    path: Path,
+    reference_decay: float = 2.0,
+    n_bins: int = 24,
+) -> "pd.DataFrame":
+    """Frequency-coverage diagnostic: radial density and radial rho profiles.
+
+    Left panel: fraction of locations sampled per radius bin, with the
+    repository's variable-density kernel at the reference decay (default 2,
+    the classical optimal-density exponent) scaled to the same budget as a
+    baseline. Right panel: the radial profile of rho — the fraction of the
+    training spectral energy in each radius bin that the mask observes.
+    Returns the underlying table so the profiles are testable.
+    """
+    import pandas as pd
+
+    from .masks import radius_map
+
+    path.parent.mkdir(parents=True, exist_ok=True)
+    shape = train_power.shape
+    r = radius_map(shape)
+    edges = np.linspace(0.0, float(r.max()) + 1e-9, n_bins + 1)
+    bin_of = np.clip(np.digitize(r.ravel(), edges) - 1, 0, n_bins - 1)
+    counts = np.bincount(bin_of, minlength=n_bins).astype(np.float64)
+    # A radius bin with no grid locations has no density or rho to report;
+    # NaN makes matplotlib skip it instead of plotting a silent zero.
+    counts_safe = np.where(counts > 0, counts, np.nan)
+    power_per_bin = np.bincount(bin_of, weights=train_power.ravel(), minlength=n_bins)
+    centers = 0.5 * (edges[:-1] + edges[1:])
+
+    budgets = {name: float(mask.sum()) for name, mask in masks_dict.items()}
+    budget = float(np.mean(list(budgets.values())))
+    # Same kernel family the variable-density generator uses, at the reference
+    # decay, scaled so its expected sample count matches the budget.
+    kernel = (1.0 + r / (0.05 * max(shape))) ** (-reference_decay)
+    kernel = np.minimum(1.0, kernel * budget / kernel.sum())
+    reference = np.bincount(bin_of, weights=kernel.ravel(), minlength=n_bins) / counts_safe
+
+    rows = []
+    fig, (ax_density, ax_rho) = plt.subplots(1, 2, figsize=(11.5, 4.4))
+    for name, mask in masks_dict.items():
+        sampled = np.bincount(bin_of, weights=mask.ravel(), minlength=n_bins)
+        observed = np.bincount(
+            bin_of, weights=(mask * train_power).ravel(), minlength=n_bins
+        )
+        density = sampled / counts_safe
+        rho_profile = np.where(
+            power_per_bin > 0, observed / np.maximum(power_per_bin, 1e-30), np.nan
+        )
+        ax_density.plot(centers, density, linewidth=1.3, label=name)
+        ax_rho.plot(centers, rho_profile, linewidth=1.3, label=name)
+        for b in range(n_bins):
+            rows.append(
+                {
+                    "mask": name,
+                    "radius": float(centers[b]),
+                    "sampled": float(sampled[b]),
+                    "density": float(density[b]),
+                    "rho_profile": float(rho_profile[b]),
+                }
+            )
+    ax_density.plot(
+        centers, reference, linewidth=1.6, linestyle="--", color="#555555",
+        label=f"decay={reference_decay:g} reference",
+    )
+    ax_density.set_xlabel("radius (frequency-domain)")
+    ax_density.set_ylabel("fraction of locations sampled")
+    ax_density.set_title("radial sampling density")
+    ax_rho.set_xlabel("radius (frequency-domain)")
+    ax_rho.set_ylabel("observed energy fraction")
+    ax_rho.set_title("radial profile of rho")
+    ax_rho.set_ylim(-0.02, 1.02)
+    for ax in (ax_density, ax_rho):
+        ax.grid(True, alpha=0.25)
+    ax_density.legend(fontsize=7)
+    fig.tight_layout()
+    fig.savefig(path, dpi=150, bbox_inches="tight")
+    plt.close(fig)
+    return pd.DataFrame(rows)
+
+
+def plot_subband_leakage(
+    masks_dict: dict[str, np.ndarray],
+    mass: dict[str, np.ndarray],
+    energies: dict[str, float],
+    path: Path,
+) -> "pd.DataFrame":
+    """Wavelet-energy-coverage diagnostic: per-subband leakage heatmap.
+
+    Cell (mask, subband) is the fraction of that subband's spectral mass on
+    unmeasured locations; the energy-weighted row sum reproduces
+    artifacts.wavelet_leakage_score exactly, which is asserted in tests.
+    Rows are sorted by total weighted leakage. Returns the leakage table.
+    """
+    import pandas as pd
+
+    path.parent.mkdir(parents=True, exist_ok=True)
+    bands = list(mass)
+    total_energy = sum(energies.values())
+    weights = np.array([energies[b] / total_energy for b in bands])
+
+    names = list(masks_dict)
+    leak = np.array(
+        [
+            [float((mass[b] * (1.0 - masks_dict[name])).sum()) for b in bands]
+            for name in names
+        ]
+    )
+    order = np.argsort(leak @ weights)
+    leak = leak[order]
+    names = [names[i] for i in order]
+
+    fig, ax = plt.subplots(figsize=(1.1 + 0.65 * len(bands), 1.2 + 0.32 * len(names)))
+    image = ax.imshow(leak, cmap="viridis", vmin=0.0, vmax=1.0, aspect="auto")
+    ax.set_xticks(range(len(bands)))
+    ax.set_xticklabels(
+        [f"{b}\n(w={w:.2f})" for b, w in zip(bands, weights)], fontsize=7
+    )
+    ax.set_yticks(range(len(names)))
+    ax.set_yticklabels(names, fontsize=7)
+    ax.set_title("per-subband null-space leakage (energy weight w in labels)", fontsize=9)
+    fig.colorbar(image, ax=ax, label="leakage fraction")
+    fig.tight_layout()
+    fig.savefig(path, dpi=150, bbox_inches="tight")
+    plt.close(fig)
+
+    table = pd.DataFrame(leak, columns=bands)
+    table.insert(0, "mask", names)
+    table["weighted_total"] = leak @ weights
+    return table
+
+
+def plot_singular_spectra(
+    spectra: dict[str, np.ndarray],
+    path: Path,
+    floor: float = 1e-12,
+) -> None:
+    """Full singular spectrum of the restricted operator, per mask (log scale).
+
+    sigma_min alone hides rank deficiency: every singular value at the
+    numerical floor is an unrecoverable direction, and ranking masks by a
+    noise-level minimum is meaningless. The full curve shows where each
+    spectrum crosses the floor and how many directions survive.
+    """
+    path.parent.mkdir(parents=True, exist_ok=True)
+    fig, ax = plt.subplots(figsize=(7.5, 4.6))
+    for name, values in spectra.items():
+        values = np.sort(np.asarray(values, dtype=np.float64))[::-1]
+        ax.plot(
+            np.arange(1, values.size + 1),
+            np.maximum(values, floor),
+            linewidth=1.3,
+            label=f"{name} ({int((values > floor).sum())}/{values.size} above floor)",
+        )
+    ax.axhline(floor, color="#555555", linestyle="--", linewidth=1.0)
+    ax.set_yscale("log")
+    ax.set_xlabel("singular value index")
+    ax.set_ylabel("singular value")
+    ax.set_title("restricted-operator singular spectra (dashed: numerical floor)")
+    ax.grid(True, which="both", alpha=0.2)
+    ax.legend(fontsize=7)
+    fig.tight_layout()
+    fig.savefig(path, dpi=150, bbox_inches="tight")
+    plt.close(fig)
+
+
+def plot_subband_sigma_min(
+    profiles: dict[str, dict[str, float]],
+    path: Path,
+    floor: float = 1e-12,
+) -> None:
+    """Per-subband smallest singular value of the restricted operator.
+
+    2-D wavelet orientation bands (horizontal/vertical/diagonal) encode
+    direction and the level hierarchy encodes scale, so this profile shows
+    *which* directions and scales a mask leaves ill-conditioned — e.g. a
+    Cartesian column mask collapses the bands whose spectral mass falls
+    between the sampled lines while leaving the orthogonal orientation
+    conditioned. Rank-deficient bands (sigma_min = 0) are drawn at the floor.
+    """
+    path.parent.mkdir(parents=True, exist_ok=True)
+    bands = list(next(iter(profiles.values())))
+    x = np.arange(len(bands))
+    fig, ax = plt.subplots(figsize=(1.6 + 0.9 * len(bands), 4.6))
+    for name, profile in profiles.items():
+        values = np.array([profile.get(band, np.nan) for band in bands], dtype=np.float64)
+        ax.plot(x, np.maximum(values, floor), marker="o", markersize=4,
+                linewidth=1.3, label=name)
+    ax.axhline(floor, color="#555555", linestyle="--", linewidth=1.0)
+    ax.set_yscale("log")
+    ax.set_xticks(x)
+    ax.set_xticklabels(bands, rotation=30, ha="right", fontsize=8)
+    ax.set_ylabel("sigma_min of the restricted operator")
+    ax.set_title("per-subband conditioning (level 1 = coarsest; dashed: floor)")
+    ax.grid(True, which="both", alpha=0.2)
+    ax.legend(fontsize=7)
+    fig.tight_layout()
+    fig.savefig(path, dpi=150, bbox_inches="tight")
+    plt.close(fig)
+
+
 def scatter_with_labels(
     x: Sequence[float],
     y: Sequence[float],
