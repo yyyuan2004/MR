@@ -101,6 +101,13 @@ def main() -> None:
     mask_dict = experiment.build_mask_family(cfg, train)
     atoms = active_support_atoms(train.numpy(), shape, wavelet, levels, args.support_size)
 
+    # wavelet_leakage is one of the repository's existing design-time
+    # predictors, so it belongs in the axis comparison alongside the others.
+    mass = artifacts.subband_spectral_mass(shape, wavelet=wavelet, levels=levels)
+    energies = artifacts.subband_energies(
+        train.detach().cpu().numpy(), wavelet=wavelet, levels=levels
+    )
+
     rows = []
     total_power = float(train_power.sum())
     for name in track(mask_dict, total=len(mask_dict), label="axis precheck"):
@@ -112,18 +119,25 @@ def main() -> None:
             "mask": name,
             "rho": float((mask * train_power).sum() / total_power),
             "psf_max_sidelobe": artifacts.psf_metrics(mask)["psf_max_sidelobe"],
-            "wavelet_leakage": None,
+            "wavelet_leakage": artifacts.wavelet_leakage_score(mask, mass, energies),
             "sigma_min": float(singular.min()),
             "cond": float(singular.max() / max(singular.min(), 1e-12)),
         })
-    table = pd.DataFrame(rows).drop(columns=["wavelet_leakage"])
+    table = pd.DataFrame(rows)
     table.to_csv(run / "metrics" / "axis_precheck.csv", index=False)
 
     print(f"\n{len(table)} masks\n")
     print(table.sort_values("rho").round(4).to_string(index=False))
 
     print("\nrank correlations between candidate axes:")
-    pairs = [("rho", "psf_max_sidelobe"), ("rho", "sigma_min"), ("psf_max_sidelobe", "sigma_min")]
+    pairs = [
+        ("rho", "psf_max_sidelobe"),
+        ("rho", "sigma_min"),
+        ("rho", "wavelet_leakage"),
+        ("psf_max_sidelobe", "sigma_min"),
+        ("psf_max_sidelobe", "wavelet_leakage"),
+        ("sigma_min", "wavelet_leakage"),
+    ]
     for a, b in pairs:
         rho, p = spearmanr(table[a], table[b])
         verdict = "REDUNDANT (|rho| > 0.8)" if abs(rho) > 0.8 else "independent enough"

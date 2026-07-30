@@ -730,9 +730,14 @@ def reconstruct_all(
         out["wavelet_ista"] = run_ista(fixed if ista_threshold is None else ista_threshold)
         # Keep the fixed-threshold arm alongside the tuned one so the gap
         # between "best achievable ISTA for this mask" and "one global
-        # threshold" is visible rather than assumed away.
-        if ista_threshold is not None and not np.isclose(ista_threshold, fixed):
-            out["wavelet_ista_fixed"] = run_ista(fixed)
+        # threshold" is visible rather than assumed away. Emitted for every
+        # mask whenever tuning is on, so the column stays complete across a
+        # sweep; when the tuned threshold equals the fixed one the same result
+        # is reused rather than recomputed.
+        if ista_threshold is not None:
+            out["wavelet_ista_fixed"] = (
+                out["wavelet_ista"] if np.isclose(ista_threshold, fixed) else run_ista(fixed)
+            )
 
     if unet_model is not None:
         unet_model.eval()

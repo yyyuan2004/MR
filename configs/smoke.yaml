@@ -41,3 +41,7 @@ recon:
 
 outputs:
   n_examples: 1
+
+# Rank is bounded by the tiny smoke train split (centered fit -> n_train - 1).
+subspace:
+  d: 3

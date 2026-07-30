@@ -46,6 +46,15 @@ def main() -> None:
         "--examples", action="store_true",
         help="also render per-mask example grids (slow: 3 figures per mask/method)",
     )
+    parser.add_argument(
+        "--tune-ista", action="store_true",
+        help="select the ISTA threshold per mask on the validation split",
+    )
+    parser.add_argument(
+        "--threshold-grid", type=float, nargs="+", default=None,
+        help="override recon.wavelet_ista.threshold_grid; tuning costs one extra "
+             "ISTA per mask per grid point, so trim the grid for large runs",
+    )
     args = parser.parse_args()
 
     cfg = load_config(args.config)
@@ -54,9 +63,19 @@ def main() -> None:
     save_config_snapshot(cfg, run, "11_budget_sweep", cli_args=vars(args))
 
     images = experiment.load_or_generate_dataset(cfg, run)
-    train, _, test = experiment.train_validation_test_split(images, cfg)
+    train, validation, test = experiment.train_validation_test_split(images, cfg)
     if args.n_test:
         test = test[: args.n_test]
+    if args.threshold_grid:
+        cfg["recon"]["wavelet_ista"]["threshold_grid"] = list(args.threshold_grid)
+    if args.tune_ista and validation.shape[0] == 0:
+        raise ValueError("--tune-ista requires data.n_val > 0")
+    if args.tune_ista:
+        grid = cfg["recon"]["wavelet_ista"].get(
+            "threshold_grid", experiment.DEFAULT_THRESHOLD_GRID
+        )
+        print(f"tuning the ISTA threshold per mask on {validation.shape[0]} validation "
+              f"images over {len(grid)} grid points")
 
     prior_mean, prior_variance, train_power = experiment.frequency_prior_statistics(train)
     subspace_statistics = experiment.fit_train_subspace_statistics(cfg, train)
@@ -93,6 +112,9 @@ def main() -> None:
             subspace_variances=subspace_statistics.eigenvalues,
             unet_model=unet,
             write_examples=args.examples,
+            # Tuning runs per mask inside evaluate_masks, so it covers the whole
+            # mask family, not just the named masks script 07 builds.
+            val_images=validation if args.tune_ista else None,
         )
         table = experiment.argumentation_table(
             mask_dict,
