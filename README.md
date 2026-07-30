@@ -44,6 +44,10 @@ Run the default CPU experiment:
 
 ```bash
 python scripts/07_compare_all_masks.py --config configs/default.yaml
+
+python scripts/13_axis_precheck.py --config configs/default.yaml
+
+python scripts/11_budget_sweep.py --config configs/default.yaml
 ```
 
 The shipped default uses 60 synthetic 64x64 images split into 36 train, 12
