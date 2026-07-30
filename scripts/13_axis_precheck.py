@@ -42,11 +42,14 @@ import torch
 
 def active_support_atoms(
     train_images: np.ndarray, shape: tuple[int, int], wavelet: str, levels: int, support_size: int
-) -> np.ndarray:
+) -> tuple[np.ndarray, list[str]]:
     """Frequency-domain columns F W*_S for the most active wavelet positions.
 
     Returns an (N_pixels, |S|) complex matrix whose columns are the centered
-    spectra of the selected wavelet atoms.
+    spectra of the selected wavelet atoms, plus the subband label of every
+    column ("approx" or "level<L>_<orientation>", level 1 = coarsest). The
+    labels let sigma_min be resolved per subband: orientation encodes
+    direction and the level hierarchy encodes scale.
     """
     coeffs = pywt.wavedec2(
         train_images.astype(np.float64), wavelet=wavelet, mode="periodization",
@@ -69,6 +72,8 @@ def active_support_atoms(
     selected = entries[:support_size]
 
     columns = []
+    labels = []
+    orientations = ("horizontal", "vertical", "diagonal")
     for _, band_index, detail_index, row, col in selected:
         blank = [np.zeros_like(template[0])] + [
             tuple(np.zeros_like(d) for d in b) for b in template[1:]
@@ -77,7 +82,10 @@ def active_support_atoms(
         target[row, col] = 1.0
         atom = pywt.waverec2(blank, wavelet=wavelet, mode="periodization")
         columns.append(fft2c(torch.from_numpy(atom)).numpy().ravel())
-    return np.stack(columns, axis=1)
+        labels.append(
+            "approx" if band_index == 0 else f"level{band_index}_{orientations[detail_index]}"
+        )
+    return np.stack(columns, axis=1), labels
 
 
 def main() -> None:
@@ -108,7 +116,10 @@ def main() -> None:
 
     print(f"building the mask family and the |S|={support_size} active support")
     mask_dict = experiment.build_mask_family(cfg, train)
-    atoms = active_support_atoms(train.numpy(), shape, wavelet, levels, support_size)
+    atoms, atom_bands = active_support_atoms(train.numpy(), shape, wavelet, levels, support_size)
+    band_order = list(dict.fromkeys(atom_bands))
+    band_columns = {band: [i for i, b in enumerate(atom_bands) if b == band] for band in band_order}
+    print(f"active support spans {len(band_order)} subbands: {', '.join(band_order)}")
 
     # wavelet_leakage is one of the repository's existing design-time
     # predictors, so it belongs in the axis comparison alongside the others.
@@ -130,6 +141,17 @@ def main() -> None:
         # unrecoverable directions, not measurements of conditioning.
         tol = float(singular.max()) * max(restricted.shape) * np.finfo(np.float64).eps
         n_deficient = int((singular <= tol).sum())
+        # Per-subband sigma_min: orientation bands separate direction, the
+        # level hierarchy separates scale, so this profile says *which*
+        # directions/scales a mask leaves ill-conditioned, not just whether.
+        band_sigma: dict[str, float] = {}
+        for band in band_order:
+            sub = restricted[:, band_columns[band]]
+            band_singular = np.linalg.svd(sub, compute_uv=False)
+            band_tol = float(band_singular.max()) * max(sub.shape) * np.finfo(np.float64).eps
+            band_sigma[f"sigma_min_{band}"] = (
+                float(band_singular.min()) if (band_singular <= band_tol).sum() == 0 else 0.0
+            )
         rows.append({
             "mask": name,
             "rho": float((mask * train_power).sum() / total_power),
@@ -138,6 +160,7 @@ def main() -> None:
             "sigma_min": float(singular.min()) if n_deficient == 0 else 0.0,
             "n_deficient": n_deficient,
             "cond": float(singular.max() / max(singular.min(), 1e-12)),
+            **band_sigma,
         })
     table = pd.DataFrame(rows)
     table.to_csv(run / "metrics" / "axis_precheck.csv", index=False)
@@ -149,6 +172,16 @@ def main() -> None:
     viz.plot_singular_spectra(
         {name: spectra[name] for name in subset}, run / "plots" / "singular_spectra.png"
     )
+    profiles = {
+        name: {band: float(table.loc[table["mask"] == name, f"sigma_min_{band}"].iloc[0])
+               for band in band_order}
+        for name in subset
+    }
+    viz.plot_subband_sigma_min(profiles, run / "plots" / "subband_sigma_min.png")
+    print("\nper-subband sigma_min (representative subset; 0 = band has "
+          "unrecoverable directions):")
+    profile_table = pd.DataFrame(profiles).T
+    print(profile_table.round(4).to_string())
 
     print(f"\n{len(table)} masks\n")
     print(table.sort_values("rho").round(4).to_string(index=False))

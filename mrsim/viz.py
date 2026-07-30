@@ -412,6 +412,41 @@ def plot_singular_spectra(
     plt.close(fig)
 
 
+def plot_subband_sigma_min(
+    profiles: dict[str, dict[str, float]],
+    path: Path,
+    floor: float = 1e-12,
+) -> None:
+    """Per-subband smallest singular value of the restricted operator.
+
+    2-D wavelet orientation bands (horizontal/vertical/diagonal) encode
+    direction and the level hierarchy encodes scale, so this profile shows
+    *which* directions and scales a mask leaves ill-conditioned — e.g. a
+    Cartesian column mask collapses the bands whose spectral mass falls
+    between the sampled lines while leaving the orthogonal orientation
+    conditioned. Rank-deficient bands (sigma_min = 0) are drawn at the floor.
+    """
+    path.parent.mkdir(parents=True, exist_ok=True)
+    bands = list(next(iter(profiles.values())))
+    x = np.arange(len(bands))
+    fig, ax = plt.subplots(figsize=(1.6 + 0.9 * len(bands), 4.6))
+    for name, profile in profiles.items():
+        values = np.array([profile.get(band, np.nan) for band in bands], dtype=np.float64)
+        ax.plot(x, np.maximum(values, floor), marker="o", markersize=4,
+                linewidth=1.3, label=name)
+    ax.axhline(floor, color="#555555", linestyle="--", linewidth=1.0)
+    ax.set_yscale("log")
+    ax.set_xticks(x)
+    ax.set_xticklabels(bands, rotation=30, ha="right", fontsize=8)
+    ax.set_ylabel("sigma_min of the restricted operator")
+    ax.set_title("per-subband conditioning (level 1 = coarsest; dashed: floor)")
+    ax.grid(True, which="both", alpha=0.2)
+    ax.legend(fontsize=7)
+    fig.tight_layout()
+    fig.savefig(path, dpi=150, bbox_inches="tight")
+    plt.close(fig)
+
+
 def scatter_with_labels(
     x: Sequence[float],
     y: Sequence[float],

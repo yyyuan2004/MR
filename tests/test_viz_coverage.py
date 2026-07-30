@@ -71,6 +71,21 @@ def test_subband_leakage_matches_scalar_score(tmp_path, mask_dict, train_power):
     assert ((table[band_columns] >= -1e-12) & (table[band_columns] <= 1.0 + 1e-12)).all().all()
 
 
+def test_subband_sigma_profile_handles_zeros_and_missing_bands(tmp_path):
+    from mrsim.viz import plot_subband_sigma_min
+
+    out = tmp_path / "profile.png"
+    plot_subband_sigma_min(
+        {
+            "point_mask": {"approx": 0.9, "level1_horizontal": 0.4, "level1_vertical": 0.5},
+            "line_mask": {"approx": 0.8, "level1_horizontal": 0.0,  # dead orientation
+                          "level1_vertical": 0.6},
+        },
+        out,
+    )
+    assert out.exists()
+
+
 def test_singular_spectra_handles_exact_zeros(tmp_path):
     out = tmp_path / "spectra.png"
     plot_singular_spectra(

@@ -119,13 +119,36 @@ reference.
 ```text
 configs/            default and CI smoke configurations
 mrsim/              simulation, masks, reconstruction, metrics, and plotting
-scripts/            core scripts 01-07 and experimental scripts 08-12
+scripts/            core scripts 01-07 and experimental scripts 08-13
 tests/              unit tests
 docs/               usage, interpretation, and reproduction guidance
 runs/               generated outputs (gitignored)
 ```
 
-Scripts 08-12 cover subspace, LOUPE-style, learned post-processing, and broad
-mask-family sweeps. They are experimental opt-in studies, are not part of the
-default evidence, and require separate validation before being used for paper
-claims.
+Scripts 08-13 cover subspace, LOUPE-style, learned post-processing, broad
+mask-family sweeps, and design-time diagnostics. They are experimental opt-in
+studies, are not part of the default evidence, and require separate validation
+before being used for paper claims.
+
+## Design-time coverage and recoverability diagnostics
+
+`scripts/13_axis_precheck.py` (with per-budget variants from
+`scripts/11_budget_sweep.py`) separates the two prior-derived questions a mask
+design must answer:
+
+- **Coverage** — how much representation energy the mask observes:
+  radial sampling density against a decay-2 variable-density reference, the
+  radial profile of the observed-energy fraction, and a per-subband wavelet
+  leakage heatmap whose energy-weighted rows reproduce the scalar
+  `wavelet_leakage` metric exactly.
+- **Recoverability** — how well-conditioned the observed content is: the full
+  singular spectrum of the restricted operator on the empirically active
+  wavelet support (never just its minimum; rank-deficient masks are excluded
+  from scalar comparisons), and a per-subband sigma_min profile in which
+  orientation bands expose direction and the level hierarchy exposes scale —
+  e.g. Cartesian column masks collapse one orientation per scale while
+  leaving the orthogonal orientation conditioned.
+
+These are prior-derived design diagnostics in the sense of the taxonomy above:
+computable before test evaluation, but dependent on the training distribution
+and the chosen representation.

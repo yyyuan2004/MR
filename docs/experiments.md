@@ -229,3 +229,18 @@ tail) is the non-energy axis; sigma_min ranked among full-rank masks is not.
 An earlier run without the support cap reported coherence and sigma_min as
 independent (rho = +0.09); that number was an artifact of rank-ordering
 numerical noise among deficient masks and is superseded by the table above.
+
+### Per-subband sigma_min profile
+
+The scalar sigma_min collapses direction and scale; the per-subband profile
+(`sigma_min_<band>` columns in `metrics/axis_precheck.csv`,
+`plots/subband_sigma_min.png`) restores both, because 2-D wavelet orientation
+bands encode direction and the level hierarchy encodes scale. On the default
+family it turns each headline number into an explanation: equispaced lines
+are rank-deficient in the approximation band and every coarse detail band
+(hence 146 dead directions), while the line-selection masks show a sharp
+orientation asymmetry — e.g. level-2 vertical sigma_min of 0.002 against
+level-2 horizontal 0.77 for `line_subspace_leakage` — which is exactly the
+statement "column sampling conditions one orientation and collapses the
+other" as a measured quantity. Point masks degrade smoothly from coarse to
+fine scales instead. Level 1 denotes the coarsest detail level.
