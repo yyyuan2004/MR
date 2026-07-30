@@ -32,7 +32,7 @@ from scipy.stats import spearmanr
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
-from mrsim import artifacts, experiment
+from mrsim import artifacts, experiment, viz
 from mrsim.config import load_config, run_dir, seed_everything
 from mrsim.fft_ops import fft2c
 from mrsim.progress import track
@@ -92,14 +92,23 @@ def main() -> None:
     images = experiment.load_or_generate_dataset(cfg, run)
     train, _, _ = experiment.train_val_test_split(images, cfg)
 
-    shape, _, _ = experiment.mask_budgets(cfg)
+    shape, n_samples, _ = experiment.mask_budgets(cfg)
     ista_cfg = cfg.get("recon", {}).get("wavelet_ista", {})
     wavelet, levels = str(ista_cfg.get("wavelet", "db4")), int(ista_cfg.get("levels", 3))
     train_power = experiment.mean_power_spectrum(train)
 
-    print(f"building the mask family and the |S|={args.support_size} active support")
+    # sigma_min of an m x |S| matrix is structurally zero once |S| > m, and
+    # near the boundary it measures conditioning of an almost-square system
+    # rather than recoverability. Cap |S| at half the measurement budget so the
+    # restricted system stays comfortably overdetermined for every mask.
+    support_size = min(args.support_size, n_samples // 2)
+    if support_size < args.support_size:
+        print(f"capping support size {args.support_size} -> {support_size} "
+              f"(measurement budget is {n_samples})")
+
+    print(f"building the mask family and the |S|={support_size} active support")
     mask_dict = experiment.build_mask_family(cfg, train)
-    atoms = active_support_atoms(train.numpy(), shape, wavelet, levels, args.support_size)
+    atoms = active_support_atoms(train.numpy(), shape, wavelet, levels, support_size)
 
     # wavelet_leakage is one of the repository's existing design-time
     # predictors, so it belongs in the axis comparison alongside the others.
@@ -109,22 +118,37 @@ def main() -> None:
     )
 
     rows = []
+    spectra: dict[str, np.ndarray] = {}
     total_power = float(train_power.sum())
     for name in track(mask_dict, total=len(mask_dict), label="axis precheck"):
         mask = mask_dict[name]
         omega = np.flatnonzero(mask.ravel() > 0.5)
         restricted = atoms[omega]  # A F W*_S
         singular = np.linalg.svd(restricted, compute_uv=False)
+        spectra[name] = singular
+        # Standard numerical-rank tolerance; singular values below it are
+        # unrecoverable directions, not measurements of conditioning.
+        tol = float(singular.max()) * max(restricted.shape) * np.finfo(np.float64).eps
+        n_deficient = int((singular <= tol).sum())
         rows.append({
             "mask": name,
             "rho": float((mask * train_power).sum() / total_power),
             "psf_max_sidelobe": artifacts.psf_metrics(mask)["psf_max_sidelobe"],
             "wavelet_leakage": artifacts.wavelet_leakage_score(mask, mass, energies),
-            "sigma_min": float(singular.min()),
+            "sigma_min": float(singular.min()) if n_deficient == 0 else 0.0,
+            "n_deficient": n_deficient,
             "cond": float(singular.max() / max(singular.min(), 1e-12)),
         })
     table = pd.DataFrame(rows)
     table.to_csv(run / "metrics" / "axis_precheck.csv", index=False)
+
+    # Coverage and recoverability visualizations on a readable subset.
+    subset = viz.representative_subset(mask_dict, train_power, n=8)
+    viz.plot_radial_coverage(subset, train_power, run / "plots" / "radial_coverage.png")
+    viz.plot_subband_leakage(subset, mass, energies, run / "plots" / "subband_leakage.png")
+    viz.plot_singular_spectra(
+        {name: spectra[name] for name in subset}, run / "plots" / "singular_spectra.png"
+    )
 
     print(f"\n{len(table)} masks\n")
     print(table.sort_values("rho").round(4).to_string(index=False))
@@ -138,8 +162,19 @@ def main() -> None:
         ("psf_max_sidelobe", "wavelet_leakage"),
         ("sigma_min", "wavelet_leakage"),
     ]
+    # Rank-deficient masks have sigma_min = 0 exactly; ranking them against
+    # each other is numerical noise, so sigma_min pairs use only full-rank rows.
+    full_rank = table[table["n_deficient"] == 0]
+    n_dropped = len(table) - len(full_rank)
+    if n_dropped:
+        print(f"  (sigma_min pairs computed on {len(full_rank)} full-rank masks; "
+              f"{n_dropped} rank-deficient masks excluded)")
     for a, b in pairs:
-        rho, p = spearmanr(table[a], table[b])
+        source = full_rank if "sigma_min" in (a, b) else table
+        if len(source) < 3:
+            print(f"  {a:18s} vs {b:18s}  skipped: too few full-rank masks")
+            continue
+        rho, p = spearmanr(source[a], source[b])
         verdict = "REDUNDANT (|rho| > 0.8)" if abs(rho) > 0.8 else "independent enough"
         print(f"  {a:18s} vs {b:18s}  rho={rho:+.3f}  p={p:.4f}   {verdict}")
 

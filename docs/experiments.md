@@ -185,3 +185,47 @@ Use the repository in the following order:
 
 Correlation CSVs produced by the scripts are descriptive diagnostics. The
 repository has no confirmatory statistical analysis pipeline.
+
+## Coverage and recoverability diagnostics (scripts 11 and 13)
+
+The design chain is Mask -> Representation -> Recoverability -> Error, and the
+middle link is a property of the measurement-operator x representation pair,
+not of any reconstruction algorithm. Energy metrics (rho, wavelet leakage)
+measure *coverage* of the representation; they cannot measure *conditioning*.
+`scripts/13_axis_precheck.py` therefore computes, alongside the coverage
+metrics, the full singular spectrum of the restricted operator A F W*_S on the
+empirically active wavelet support, and three plots make each link visible:
+
+- `plots/radial_coverage.png` — radial sampling density per mask with the
+  variable-density kernel at decay 2 as a reference, plus the radial profile
+  of rho (per-radius observed energy fraction). Also emitted per budget by
+  `scripts/11_budget_sweep.py`.
+- `plots/subband_leakage.png` — per-subband leakage heatmap; the
+  energy-weighted row total reproduces `wavelet_leakage_score` exactly
+  (tested). Also emitted per budget by script 11.
+- `plots/singular_spectra.png` — the *entire* singular spectrum per mask, not
+  just sigma_min. The support size is capped at half the measurement budget:
+  sigma_min of an m x |S| matrix is structurally zero once |S| > m, and near
+  that boundary it measures nothing. Rank-deficient masks are excluded from
+  sigma_min correlations (ranking values at the numerical floor is noise).
+
+Measured on the default 31-mask family (24 full-rank, 7 rank-deficient):
+
+| pair | Spearman rho |
+| --- | --- |
+| rho vs PSF max sidelobe | +0.433 |
+| rho vs wavelet_leakage | -0.994 |
+| rho vs sigma_min (full-rank masks) | +0.967 |
+| PSF max sidelobe vs sigma_min (full-rank masks) | +0.973 |
+
+Two conclusions. First, the coverage metrics are interchangeable: rho and
+wavelet leakage are near-perfect mirrors, so a 2-D diagnostic should never
+spend both axes on them. Second, among full-rank masks sigma_min adds nothing
+beyond coverage either — the discriminating recoverability signal on this
+family is the *rank deficiency itself*: equispaced lines leave 146 of 256
+active-support directions exactly unrecoverable, variable-density lines 13-50,
+and every point-wise mask none. That count (and the shape of the spectrum's
+tail) is the non-energy axis; sigma_min ranked among full-rank masks is not.
+An earlier run without the support cap reported coherence and sigma_min as
+independent (rho = +0.09); that number was an artifact of rank-ordering
+numerical noise among deficient masks and is superseded by the table above.
