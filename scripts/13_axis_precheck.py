@@ -88,10 +88,132 @@ def active_support_atoms(
     return np.stack(columns, axis=1), labels
 
 
+def atom_spectrum_pool(
+    train_images: np.ndarray,
+    shape: tuple[int, int],
+    wavelet: str,
+    levels: int,
+    pool_size: int,
+) -> tuple[np.ndarray, list[str], np.ndarray, np.ndarray]:
+    """Cache the spectra of the most active wavelet positions, once.
+
+    Drawing many supports is only affordable if the atom spectra are computed
+    once instead of per support. The pool is the ``pool_size`` positions with
+    the largest mean coefficient energy; supports are then column selections
+    out of it. Also returns each position's energy (a sampling weight) and its
+    parent index within the pool, or -1 when the parent is outside it, which is
+    what the tree-structured sampler needs.
+    """
+    coeffs = pywt.wavedec2(
+        train_images.astype(np.float64), wavelet=wavelet, mode="periodization",
+        level=levels, axes=(-2, -1),
+    )
+    template = pywt.wavedec2(np.zeros(shape), wavelet=wavelet, mode="periodization", level=levels)
+
+    entries = []  # (energy, band_index, detail_index, row, col)
+    approx_energy = np.mean(np.abs(coeffs[0]) ** 2, axis=0)
+    entries += [(approx_energy[r, c], 0, -1, r, c)
+                for r in range(approx_energy.shape[0])
+                for c in range(approx_energy.shape[1])]
+    for band_index, band in enumerate(coeffs[1:], start=1):
+        for detail_index, detail in enumerate(band):
+            energy = np.mean(np.abs(detail) ** 2, axis=0)
+            entries += [(energy[r, c], band_index, detail_index, r, c)
+                        for r in range(energy.shape[0]) for c in range(energy.shape[1])]
+    entries.sort(key=lambda e: -e[0])
+    selected = entries[:pool_size]
+
+    position_to_pool = {
+        (band_index, detail_index, row, col): index
+        for index, (_, band_index, detail_index, row, col) in enumerate(selected)
+    }
+
+    orientations = ("horizontal", "vertical", "diagonal")
+    columns, labels, parents = [], [], []
+    for _energy, band_index, detail_index, row, col in track(
+        selected, total=len(selected), label="atom spectra"
+    ):
+        blank = [np.zeros_like(template[0])] + [
+            tuple(np.zeros_like(d) for d in b) for b in template[1:]
+        ]
+        target = blank[0] if band_index == 0 else blank[band_index][detail_index]
+        target[row, col] = 1.0
+        atom = pywt.waverec2(blank, wavelet=wavelet, mode="periodization")
+        columns.append(fft2c(torch.from_numpy(atom)).numpy().ravel().astype(np.complex64))
+        labels.append(
+            "approx" if band_index == 0 else f"level{band_index}_{orientations[detail_index]}"
+        )
+        # A detail coefficient's parent sits one level coarser at half the
+        # spatial index; approximation coefficients have no parent.
+        parents.append(
+            position_to_pool.get((band_index - 1, detail_index, row // 2, col // 2), -1)
+            if band_index > 1
+            else -1
+        )
+    energies = np.array([entry[0] for entry in selected], dtype=np.float64)
+    return np.stack(columns, axis=1), labels, energies, np.array(parents, dtype=np.int64)
+
+
+def sample_supports(
+    energies: np.ndarray,
+    parents: np.ndarray,
+    support_size: int,
+    n_supports: int,
+    rng: np.random.Generator,
+    *,
+    model: str = "energy",
+    tree_boost: float = 8.0,
+) -> list[np.ndarray]:
+    """Draw candidate sparse supports from the pool.
+
+    A single aggregated support turns a union-of-subspaces problem back into a
+    single-subspace one, which is the linear-Gaussian regime where conditioning
+    is largely determined by coverage. Sampling many supports restores the
+    union structure, and the distribution of ``sigma_min`` over them -- not its
+    value on one support -- is the quantity that can carry information coverage
+    does not.
+
+    ``model="energy"`` draws positions independently with probability
+    proportional to mean coefficient energy. ``model="tree"`` additionally
+    boosts a position whose parent is already in the support, because wavelet
+    coefficients are not independent across scales: large coefficients persist
+    along parent-child chains, so real supports are clustered in the tree
+    rather than scattered.
+    """
+    if model not in {"energy", "tree"}:
+        raise ValueError("model must be 'energy' or 'tree'")
+    weights = np.maximum(energies, 1e-300)
+    supports = []
+    for _ in range(n_supports):
+        if model == "energy":
+            probability = weights / weights.sum()
+            supports.append(
+                rng.choice(weights.size, size=support_size, replace=False, p=probability)
+            )
+            continue
+        chosen: list[int] = []
+        available = np.ones(weights.size, dtype=bool)
+        current = weights.copy()
+        for _ in range(support_size):
+            probability = np.where(available, current, 0.0)
+            probability = probability / probability.sum()
+            pick = int(rng.choice(weights.size, p=probability))
+            chosen.append(pick)
+            available[pick] = False
+            # Children of the chosen position become more likely.
+            current[parents == pick] *= tree_boost
+        supports.append(np.array(chosen, dtype=np.int64))
+    return supports
+
+
 def main() -> None:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--config", default="configs/default.yaml")
     parser.add_argument("--support-size", type=int, default=256)
+    parser.add_argument("--n-supports", type=int, default=24,
+                        help="random supports drawn per sampling model (0 disables)")
+    parser.add_argument("--pool-size", type=int, default=768,
+                        help="most-active wavelet positions the supports are drawn from")
     args = parser.parse_args()
 
     cfg = load_config(args.config)
@@ -166,6 +288,70 @@ def main() -> None:
             **band_sigma,
         })
     table = pd.DataFrame(rows)
+
+    # Distribution of sigma_min over sampled supports. The fixed aggregated
+    # support above collapses the union-of-subspaces structure; this restores it.
+    if args.n_supports > 0:
+        pool_atoms, _pool_labels, pool_energies, pool_parents = atom_spectrum_pool(
+            train.numpy(), shape, wavelet, levels, args.pool_size
+        )
+        support_rng = np.random.default_rng(int(cfg["seed"]))
+        support_sets = {
+            model: sample_supports(
+                pool_energies, pool_parents, support_size,
+                args.n_supports, support_rng, model=model,
+            )
+            for model in ("energy", "tree")
+        }
+        distribution_rows = []
+        for name in track(mask_dict, total=len(mask_dict), label="support ensemble"):
+            omega = np.flatnonzero(mask_dict[name].ravel() > 0.5)
+            restricted_all = pool_atoms[omega]
+            for model, supports in support_sets.items():
+                minima = []
+                for support in supports:
+                    block = restricted_all[:, support]
+                    singular = np.linalg.svd(block, compute_uv=False)
+                    tolerance = (
+                        float(singular.max())
+                        * max(block.shape)
+                        * np.finfo(np.float32).eps
+                    )
+                    minima.append(
+                        0.0 if (singular <= tolerance).any() else float(singular.min())
+                    )
+                minima = np.asarray(minima)
+                distribution_rows.append({
+                    "mask": name,
+                    "support_model": model,
+                    "n_supports": len(supports),
+                    "sigma_min_median": float(np.median(minima)),
+                    "sigma_min_p10": float(np.quantile(minima, 0.1)),
+                    "sigma_min_p90": float(np.quantile(minima, 0.9)),
+                    "p_rank_deficient": float(np.mean(minima == 0.0)),
+                })
+        distribution = pd.DataFrame(distribution_rows)
+        distribution.to_csv(
+            run / "metrics" / "axis_precheck_support_distribution.csv", index=False
+        )
+        print("\nsigma_min over sampled supports (restores the union-of-subspaces "
+              "structure the single fixed support removes):")
+        print(distribution.round(5).to_string(index=False))
+
+        merged = distribution.merge(table[["mask", "rho"]], on="mask")
+        print("\nrank correlation with coverage, per support model:")
+        for model, block in merged.groupby("support_model"):
+            usable = block[block["p_rank_deficient"] < 1.0]
+            if usable["sigma_min_median"].nunique() < 3:
+                print(f"  {model:8s}  skipped: too few distinct values")
+                continue
+            statistic = spearmanr(usable["rho"], usable["sigma_min_median"]).statistic
+            verdict = (
+                "REDUNDANT with coverage" if abs(statistic) > 0.8
+                else "carries information coverage does not"
+            )
+            print(f"  {model:8s}  rho vs median sigma_min = {statistic:+.3f}   {verdict}")
+
     table.to_csv(run / "metrics" / "axis_precheck.csv", index=False)
 
     # Coverage and recoverability visualizations on a readable subset.
