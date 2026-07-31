@@ -50,10 +50,20 @@ python scripts/13_axis_precheck.py --config configs/default.yaml
 python scripts/11_budget_sweep.py --config configs/default.yaml
 ```
 
-The shipped default uses 60 synthetic 64x64 images split into 36 train, 12
-validation, and 12 test images. It compares five baselines:
-`uniform_random`, `variable_density`, `multilevel_random`,
+The shipped default uses 400 synthetic 64x64 images split into 200 train, 100
+validation, and 100 test images. It compares six baselines: `uniform_random`,
+`variable_density`, `multilevel_random`, `multilevel_local_coherence`,
 `equispaced_lines`, and `variable_density_lines`.
+
+Summary tables carry percentile bootstrap intervals over images. Several mask
+differences in the default family are smaller than those intervals, so read the
+intervals rather than the means.
+
+For per-sample error certificates:
+
+```bash
+python scripts/14_conformal_certificate.py --config configs/default.yaml
+```
 
 For a minimal wiring check, use:
 
@@ -95,6 +105,36 @@ these categories separate:
 `measurement_residual_norm = ||y - A recon||` is reported separately and is
 directly computable from a measurement and reconstruction. It is not the same
 as the oracle observed-subspace error.
+
+## Real signals: nominal versus effective budget
+
+The synthetic signals are real, so `X(-k) = conj(X(k))` and sampling both
+members of a conjugate pair acquires one complex unknown rather than two. The
+effective budget is the number of conjugate orbits a mask touches, reported as
+`effective_samples` and `hermitian_redundancy`.
+
+At the shipped 25% budget these diverge sharply: `uniform_random` reaches 875
+effective samples while `equispaced_lines` reaches 514, because its column set
+is closed under conjugation and half its acquisition is redundant. Any
+"equal-budget" statement should name which budget it means.
+
+This also removes the usual justification for top-k mask design. A real
+signal's power spectrum is symmetric, so ranking by prior power selects both
+members of each pair; `greedy.greedy_a_optimal_hermitian` allocates over orbits
+instead and halves the exact Bayes MMSE at the default settings.
+
+## Exact design quantities
+
+`mrsim/design.py` computes the Bayes MMSE and mutual information in closed form
+for the diagonal spectral prior and the PCA subspace prior, plus an optimality
+gap in nats against the exact binary optimum. These are the quantities that
+`rho`, `wavelet_leakage`, and `mask_score` were approximating.
+
+`mrsim/certify.py` provides split-conformal error certificates with
+finite-sample marginal coverage under exchangeability. See
+[`docs/experiments.md`](docs/experiments.md) for what that does and does not
+guarantee — in particular it is not conditional coverage, which is provably
+unattainable distribution-free.
 
 ## Point masks and line masks
 
@@ -148,12 +188,18 @@ design must answer:
   leakage heatmap whose energy-weighted rows reproduce the scalar
   `wavelet_leakage` metric exactly.
 - **Recoverability** — how well-conditioned the observed content is: the full
-  singular spectrum of the restricted operator on the empirically active
-  wavelet support (never just its minimum; rank-deficient masks are excluded
-  from scalar comparisons), and a per-subband sigma_min profile in which
-  orientation bands expose direction and the level hierarchy exposes scale —
-  e.g. Cartesian column masks collapse one orientation per scale while
-  leaving the orthogonal orientation conditioned.
+  singular spectrum of the restricted operator (never just its minimum;
+  rank-deficient masks are excluded from scalar comparisons), and a per-subband
+  sigma_min profile in which orientation bands expose direction and the level
+  hierarchy exposes scale — e.g. Cartesian column masks collapse one
+  orientation per scale while leaving the orthogonal orientation conditioned.
+
+  Conditioning is measured over a *distribution* of sparse supports, not one
+  aggregated support. That distinction decides the answer: against a single
+  fixed support, `sigma_min` correlates with coverage at +0.963 and looks
+  redundant; against 16 drawn supports the correlation falls to +0.477
+  (energy-weighted) or +0.387 (tree-structured), so it does carry information
+  coverage does not.
 
 These are prior-derived design diagnostics in the sense of the taxonomy above:
 computable before test evaluation, but dependent on the training distribution
