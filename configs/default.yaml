@@ -5,11 +5,16 @@ seed: 0
 n_workers: 1               # >1 builds the mask family on a thread pool (A3)
 
 data:
-  n_images: 60
+  # Synthetic images cost microseconds to generate, so the previous 36/12/12
+  # split was buying nothing. At 12 test images the 90% conformal coverage
+  # interval spans [0.730, 1.000] and bootstrap intervals on PSNR are wider
+  # than the gaps between masks, so nothing was distinguishable. 200/100/100
+  # narrows the coverage interval to roughly [0.84, 0.96] and still runs on CPU.
+  n_images: 400
   image_size: 64
-  n_train: 36
-  n_val: 12
-  n_test: 12
+  n_train: 200
+  n_val: 100
+  n_test: 100
   phantom: ellipses        # ellipses | shepp_logan
   min_ellipses: 3
   max_ellipses: 8

@@ -98,12 +98,38 @@ def main() -> None:
     summary.columns = ["_".join(col) for col in summary.columns]
     summary = summary.reset_index()
     summary["mask_score"] = summary["mask"].map(scores)
+
+    # Bootstrap intervals over images for the two headline outcomes. Mask
+    # differences here are often smaller than the sampling uncertainty of the
+    # mean, and the interval is the only thing that shows it.
+    intervals = (
+        frame.groupby(["mask", "method"])
+        .apply(
+            lambda block: pd.Series(
+                {
+                    "psnr_ci_low": experiment.bootstrap_ci(block["psnr"])[0],
+                    "psnr_ci_high": experiment.bootstrap_ci(block["psnr"])[1],
+                    "complex_mse_ci_low": experiment.bootstrap_ci(block["complex_mse"])[0],
+                    "complex_mse_ci_high": experiment.bootstrap_ci(block["complex_mse"])[1],
+                }
+            ),
+            include_groups=False,
+        )
+        .reset_index()
+    )
+    summary = summary.merge(intervals, on=["mask", "method"], how="left")
+
     mask_metadata = pd.DataFrame(
         [
             {
                 "mask": name,
                 "actual_n_samples": int(mask.sum()),
                 "actual_acceleration": float(mask.size / mask.sum()),
+                # The effective (conjugate-orbit) budget arrives via the PSF
+                # metrics frame, which save_mask_bundle already populates.
+                "effective_acceleration": float(
+                    mask.size / max(artifacts.effective_sample_count(mask), 1)
+                ),
                 "acquisition_family": experiment.acquisition_family(mask),
             }
             for name, mask in mask_dict.items()

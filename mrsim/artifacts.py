@@ -172,6 +172,68 @@ def decompose_error(
     )
 
 
+def bias_variance_decomposition(
+    reconstructions: torch.Tensor,
+    truth: torch.Tensor,
+    mask: np.ndarray | torch.Tensor,
+    *,
+    operator=None,
+) -> dict[str, float]:
+    """Split expected error into bias and variance within each subspace.
+
+    ``reconstructions`` holds ``R`` estimates of the *same* ``truth`` under
+    different noise realizations, so the expectation is over measurement noise
+    with the signal held fixed. Writing ``e_r = x_hat_r - x`` and
+    ``e_bar = E[e]``,
+
+        E||e||^2 = ||e_bar||^2 + E||e - e_bar||^2
+
+    and each term splits again through the orthogonal projector, giving four
+    non-negative pieces that sum exactly to the total -- there are no cross
+    terms, because ``P`` and ``I - P`` are orthogonal and the projections are
+    deterministic.
+
+    The four pieces answer a question the observed/null split alone cannot:
+    whether an arm is losing to a prior that is too strong (bias) or to noise
+    amplification (variance), and in which subspace. A regularized estimator
+    that trades null-space bias for observed-subspace variance reduction looks
+    identical to a poorly conditioned one under the two-way split.
+    """
+    project = projector if operator is None else operator.projector
+    if reconstructions.ndim != 3:
+        raise ValueError("reconstructions must have shape (n_realizations, H, W)")
+    if reconstructions.shape[0] < 2:
+        raise ValueError("need at least two noise realizations to estimate a variance")
+    if tuple(reconstructions.shape[-2:]) != tuple(truth.shape[-2:]):
+        raise ValueError(
+            f"reconstruction shape {tuple(reconstructions.shape[-2:])} does not "
+            f"match truth shape {tuple(truth.shape[-2:])}"
+        )
+
+    errors = reconstructions.to(torch.complex64) - truth.to(torch.complex64)[None]
+    mean_error = errors.mean(dim=0)
+    fluctuation = errors - mean_error[None]
+
+    mean_observed = project(mean_error, mask)
+    mean_null = mean_error - mean_observed
+    fluctuation_observed = project(fluctuation, mask)
+    fluctuation_null = fluctuation - fluctuation_observed
+
+    def energy(tensor: torch.Tensor) -> float:
+        return float((tensor.abs() ** 2).sum().item())
+
+    n = reconstructions.shape[0]
+    pieces = {
+        "bias2_observed": energy(mean_observed),
+        "bias2_null": energy(mean_null),
+        "var_observed": energy(fluctuation_observed) / n,
+        "var_null": energy(fluctuation_null) / n,
+    }
+    pieces["total"] = float(sum(pieces.values()))
+    pieces["expected_total_error"] = energy(errors) / n
+    return pieces
+
+
 def aliasing_energy_ratio(image: torch.Tensor, mask: np.ndarray | torch.Tensor) -> float:
     """Fraction of image energy lost by the sampling projector, ||(I-P)x||^2 / ||x||^2."""
     parts = decompose(image, mask)

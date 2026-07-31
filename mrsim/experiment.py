@@ -15,7 +15,7 @@ import numpy as np
 import pandas as pd
 import torch
 
-from . import artifacts, data, greedy, masks, metrics, recon, subspace, viz
+from . import artifacts, data, design, greedy, masks, metrics, recon, subspace, viz
 from .config import config_fingerprint
 from .fft_ops import fft2c
 from .progress import track
@@ -1071,6 +1071,16 @@ def argumentation_table(
         row["mask_score"] = artifacts.expected_zero_filled_mse(
             mask, train_power, noise_std=noise_std
         )
+        # Exact Bayes floor under the fitted Gaussian spectral prior. Unlike
+        # mask_score it is not tied to one estimator, so the per-method gap to
+        # it separates "the design cannot do better" from "this reconstruction
+        # is leaving accuracy on the table".
+        if noise_std > 0.0:
+            bayes = design.diagonal_bayes(
+                mask, train_power, noise_std**2, hermitian=True
+            )
+            row["bayes_mmse_per_pixel"] = bayes["bayes_mmse_per_pixel"]
+            row["mutual_information_nats"] = bayes["mutual_information_nats"]
         row["prior_observable_energy_fraction"] = (
             artifacts.prior_observable_energy_fraction(mask, train_power)
         )
@@ -1095,6 +1105,14 @@ def argumentation_table(
         for method in sorted(sub["method"].unique()):
             block = sub[sub["method"] == method]
             row[f"complex_mse_{method}"] = float(block["complex_mse"].mean())
+            if "bayes_mmse_per_pixel" in row:
+                # Negative values are meaningful rather than a bug: the Bayes
+                # floor is exact only for the fitted *Gaussian* prior, and the
+                # phantoms are not Gaussian, so a method exploiting structure
+                # the Gaussian model cannot represent may beat it.
+                row[f"excess_over_bayes_{method}"] = (
+                    float(block["complex_mse"].mean()) - row["bayes_mmse_per_pixel"]
+                )
             row[f"magnitude_mse_{method}"] = float(block["magnitude_mse"].mean())
             row[f"recon_nullspace_norm_{method}"] = float(
                 block["recon_nullspace_norm"].mean()
@@ -1111,6 +1129,39 @@ def argumentation_table(
                 )
         rows.append(row)
     return pd.DataFrame(rows)
+
+
+def bootstrap_ci(
+    values: np.ndarray | pd.Series,
+    *,
+    confidence: float = 0.95,
+    n_boot: int = 2000,
+    seed: int = 0,
+) -> tuple[float, float]:
+    """Percentile bootstrap interval for the mean of per-image metrics.
+
+    A mean over a dozen synthetic images carries far more uncertainty than the
+    four printed decimals suggest, and mask comparisons in this package are
+    routinely decided by differences smaller than that uncertainty. Reporting
+    the interval alongside the mean is what keeps those comparisons honest.
+
+    Resampling is over images, which is the unit that was drawn independently.
+    It is *not* over masks: masks in a design sweep are constructed, dependent
+    objects, so an interval across them would not mean anything.
+    """
+    sample = np.asarray(values, dtype=np.float64).ravel()
+    if sample.size == 0:
+        return (float("nan"), float("nan"))
+    if sample.size == 1:
+        return (float(sample[0]), float(sample[0]))
+    if not 0.0 < confidence < 1.0:
+        raise ValueError("confidence must lie strictly between 0 and 1")
+    rng = np.random.default_rng(seed)
+    draws = rng.integers(0, sample.size, size=(n_boot, sample.size))
+    means = sample[draws].mean(axis=1)
+    tail = 0.5 * (1.0 - confidence)
+    low, high = np.quantile(means, [tail, 1.0 - tail])
+    return (float(low), float(high))
 
 
 def rank_correlations(
