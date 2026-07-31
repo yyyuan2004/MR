@@ -13,7 +13,13 @@ from __future__ import annotations
 import numpy as np
 from scipy.ndimage import binary_dilation
 
-from .artifacts import psf_metrics, subband_energies, subband_spectral_mass
+from .artifacts import (
+    conjugate_partner_index,
+    psf_metrics,
+    self_conjugate_positions,
+    subband_energies,
+    subband_spectral_mass,
+)
 from .masks import (
     center_indices,
     fill_lines,
@@ -90,6 +96,89 @@ def greedy_a_optimal(
     free_order = order[~selected[order]]
     n_needed = n_samples - int(selected.sum())
     selected[free_order[:n_needed]] = True
+    return mask_from_indices(shape, np.flatnonzero(selected))
+
+
+def greedy_a_optimal_hermitian(
+    spectrum: np.ndarray,
+    n_samples: int,
+    noise_var: float = 1e-3,
+    n_center: int = 0,
+) -> np.ndarray:
+    """A-optimal point selection for a *real* signal under a diagonal prior.
+
+    :func:`greedy_a_optimal` models every frequency as an independent complex
+    unknown, and under that model the optimal design really is a top-k ranking
+    of the prior spectrum. Real signals violate the model: ``X(-k)`` is
+    determined by ``X(k)``, so a conjugate pair is one complex unknown, and the
+    prior spectrum of a real signal is symmetric -- which means a top-k rule
+    picks both members of each pair and spends roughly half the budget buying
+    noise averaging on values it already knows.
+
+    This selector allocates the budget over conjugate *orbits* instead. The
+    posterior variance of an orbit after ``n`` looks is ``s sigma^2 /
+    (sigma^2 + c n s)`` (with ``c = 2`` for a self-conjugate frequency, whose
+    value is real and informed only by the real part of the observation), so
+    the objective is separable across orbits and concave in the number of looks.
+    Greedy allocation of increments is therefore exactly optimal, not merely a
+    heuristic -- ``tests/test_design_exact.py`` checks that against exhaustive
+    enumeration.
+
+    Second looks are not forbidden: when the noise variance is large relative
+    to ``s_k`` the averaging really is worth more than a fresh orbit, and the
+    increments express that trade-off rather than assuming an answer.
+    """
+    spectrum_array = np.asarray(spectrum, dtype=np.float64)
+    if spectrum_array.ndim != 2:
+        raise ValueError("spectrum must be a two-dimensional array")
+    shape = spectrum_array.shape
+    validate_budget(shape, n_samples, n_center)
+    if not np.isfinite(noise_var) or noise_var <= 0.0:
+        raise ValueError("noise_var must be finite and positive")
+    if not np.all(np.isfinite(spectrum_array)) or np.any(spectrum_array < 0.0):
+        raise ValueError("spectrum must be finite and non-negative")
+
+    rows, cols = conjugate_partner_index(shape)
+    partner = (np.arange(shape[0] * shape[1])
+               .reshape(shape)[np.ix_(rows, cols)]
+               .ravel())
+    self_conjugate = self_conjugate_positions(shape).ravel()
+    flat_spectrum = spectrum_array.ravel()
+
+    selected = _preselect_center(shape, n_center)
+    # Looks already bought per orbit, keyed by the orbit's representative.
+    representative = np.minimum(np.arange(partner.size), partner)
+    looks: dict[int, int] = {}
+    for index in np.flatnonzero(selected):
+        looks[int(representative[index])] = looks.get(int(representative[index]), 0) + 1
+
+    def variance(rep: int, n: int) -> float:
+        s = flat_spectrum[rep]
+        if s <= 0.0:
+            return 0.0
+        scale = 2.0 if self_conjugate[rep] else 1.0
+        return s * noise_var / (noise_var + scale * n * s)
+
+    def increment(rep: int) -> float:
+        """MMSE reduction from buying one more look at this orbit."""
+        n = looks.get(rep, 0)
+        size = 1.0 if self_conjugate[rep] else 2.0
+        return size * (variance(rep, n) - variance(rep, n + 1))
+
+    n_selected = int(selected.sum())
+    while n_selected < n_samples:
+        best_index, best_gain = -1, -np.inf
+        for index in np.flatnonzero(~selected):
+            gain = increment(int(representative[index]))
+            if gain > best_gain:
+                best_index, best_gain = int(index), gain
+        if best_index < 0:
+            break
+        selected[best_index] = True
+        rep = int(representative[best_index])
+        looks[rep] = looks.get(rep, 0) + 1
+        n_selected += 1
+
     return mask_from_indices(shape, np.flatnonzero(selected))
 
 
