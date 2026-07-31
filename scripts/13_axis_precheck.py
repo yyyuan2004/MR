@@ -155,6 +155,9 @@ def main() -> None:
         rows.append({
             "mask": name,
             "rho": float((mask * train_power).sum() / total_power),
+            "rho_real": artifacts.prior_observable_energy_fraction_real(mask, train_power),
+            "effective_samples": artifacts.effective_sample_count(mask),
+            "hermitian_redundancy": artifacts.hermitian_redundancy(mask),
             "psf_max_sidelobe": artifacts.psf_metrics(mask)["psf_max_sidelobe"],
             "wavelet_leakage": artifacts.wavelet_leakage_score(mask, mass, energies),
             "sigma_min": float(singular.min()) if n_deficient == 0 else 0.0,

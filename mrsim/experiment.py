@@ -610,7 +610,12 @@ def save_mask_bundle(mask: np.ndarray, name: str, run: Path) -> dict[str, float]
     temp_path.replace(manifest_path)
     viz.save_image(mask, run / "masks" / f"{name}.png", title=name)
     viz.plot_psf(mask, run / "psf" / f"{name}_psf.png", title=name)
-    row: dict[str, float] = {"mask": name, "n_samples": float(mask.sum())}
+    row: dict[str, float] = {
+        "mask": name,
+        "n_samples": float(mask.sum()),
+        "effective_samples": float(artifacts.effective_sample_count(mask)),
+        "hermitian_redundancy": artifacts.hermitian_redundancy(mask),
+    }
     row.update(artifacts.psf_metrics(mask))
     return row
 
@@ -1044,10 +1049,19 @@ def argumentation_table(
         sub = frame[frame["mask"] == name]
         base = sub[sub["method"] == baseline_method]
         n_samples = int(np.asarray(mask).sum())
+        # For a real-valued signal, conjugate pairs carry one complex unknown,
+        # so the effective budget is the number of conjugate orbits observed.
+        # Equal nominal budgets can differ substantially in this quantity, and
+        # the difference is systematic across mask families, so both the
+        # nominal and the effective budget are reported side by side.
+        effective_samples = artifacts.effective_sample_count(mask)
         row: dict[str, Any] = {
             "mask": name,
             "actual_n_samples": n_samples,
             "actual_acceleration": float(mask.size / max(n_samples, 1)),
+            "effective_n_samples": effective_samples,
+            "effective_acceleration": float(mask.size / max(effective_samples, 1)),
+            "hermitian_redundancy": artifacts.hermitian_redundancy(mask),
             "acquisition_family": acquisition_family(mask),
         }
         row["mask_score"] = artifacts.expected_zero_filled_mse(
@@ -1058,6 +1072,12 @@ def argumentation_table(
         )
         row["prior_unobservable_energy_fraction"] = (
             1.0 - row["prior_observable_energy_fraction"]
+        )
+        # Real-signal version: energy whose conjugate partner was measured is
+        # determined too. The point-wise column above understates coverage, and
+        # understates it unevenly across mask families.
+        row["prior_observable_energy_fraction_real"] = (
+            artifacts.prior_observable_energy_fraction_real(mask, train_power)
         )
         row.update(artifacts.psf_metrics(mask))
         row.update(artifacts.spectrum_weighted_psf_metrics(mask, train_power))

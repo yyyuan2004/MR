@@ -358,6 +358,100 @@ def expected_zero_filled_noise_mse(mask: np.ndarray, noise_std: float) -> float:
     return float(noise_std**2 * np.sum(np.abs(mask_array) ** 2) / mask_array.size)
 
 
+def conjugate_partner_index(shape: tuple[int, int]) -> tuple[np.ndarray, np.ndarray]:
+    """Per-axis index maps sending each centered frequency to its negative.
+
+    With the centered convention used throughout this package, axis index ``i``
+    carries frequency ``i - c`` for ``c = n // 2``, so the partner index solves
+    ``j - c = -(i - c)``, i.e. ``j = (2c - i) mod n``. The modulus handles both
+    parities: for even ``n`` the Nyquist index 0 maps to itself because
+    ``+n/2`` and ``-n/2`` are the same frequency, and for odd ``n`` the map is
+    the plain reversal ``j = n - 1 - i``.
+    """
+    return tuple(
+        (2 * (n // 2) - np.arange(n)) % n for n in shape
+    )  # type: ignore[return-value]
+
+
+def conjugate_reflect(array: np.ndarray) -> np.ndarray:
+    """Reflect a centered frequency-domain array through the origin."""
+    rows, cols = conjugate_partner_index(array.shape)
+    return array[np.ix_(rows, cols)]
+
+
+def self_conjugate_positions(shape: tuple[int, int]) -> np.ndarray:
+    """Boolean grid marking frequencies that are their own conjugate partner."""
+    rows, cols = conjugate_partner_index(shape)
+    return np.outer(rows == np.arange(shape[0]), cols == np.arange(shape[1]))
+
+
+def conjugate_orbit_coverage(mask: np.ndarray) -> np.ndarray:
+    """Binary grid marking every frequency whose conjugate orbit is observed.
+
+    For a real-valued signal ``X(-k) = conj(X(k))``, so measuring either member
+    of an orbit determines both. The coverage grid is therefore
+    ``max(M, reflect(M))`` and is closed under reflection by construction.
+    """
+    mask_array = np.asarray(mask, dtype=np.float64)
+    return np.maximum(mask_array, conjugate_reflect(mask_array))
+
+
+def effective_sample_count(mask: np.ndarray) -> int:
+    """Number of distinct conjugate orbits a mask observes.
+
+    This is the effective complex degrees of freedom acquired when the
+    underlying signal is real: sampling both ``k`` and ``-k`` yields one
+    complex unknown, not two, so the nominal sample count overstates the
+    information budget. The covered grid splits into orbits of size two plus
+    self-conjugate singletons, giving ``(covered + self_conjugate_covered) / 2``.
+    """
+    covered = conjugate_orbit_coverage(mask) > 0.5
+    n_covered = int(covered.sum())
+    n_self = int(np.logical_and(covered, self_conjugate_positions(covered.shape)).sum())
+    return (n_covered + n_self) // 2
+
+
+def hermitian_redundancy(mask: np.ndarray) -> float:
+    """Fraction of a real-signal acquisition spent on already-determined values.
+
+    ``1 - effective_sample_count / n_samples``. Zero means every sample opens a
+    new conjugate orbit; 0.5 means the mask is closed under conjugation and
+    exactly half the acquisition is redundant, which is what a centered
+    equispaced Cartesian column set does.
+    """
+    n_samples = int(np.asarray(mask).sum())
+    if n_samples == 0:
+        return 0.0
+    return 1.0 - effective_sample_count(mask) / n_samples
+
+
+def prior_observable_energy_fraction_real(
+    mask: np.ndarray, mean_power: np.ndarray
+) -> float:
+    """Real-signal counterpart of :func:`prior_observable_energy_fraction`.
+
+    Energy on an unmeasured frequency whose conjugate partner *is* measured is
+    observable, because conjugate symmetry determines it. Crediting only the
+    literally sampled locations therefore understates coverage, and understates
+    it unevenly across mask families: a conjugation-closed design is charged
+    twice for information it acquired once. This version credits whole orbits.
+    """
+    mask_array = np.asarray(mask, dtype=np.float64)
+    power = np.asarray(mean_power, dtype=np.float64)
+    if mask_array.shape != power.shape:
+        raise ValueError(
+            f"mask shape {mask_array.shape} does not match mean_power shape {power.shape}"
+        )
+    if not np.isin(mask_array, (0.0, 1.0)).all():
+        raise ValueError("mask must be binary")
+    if not np.isfinite(power).all() or np.any(power < 0.0):
+        raise ValueError("mean_power must contain finite, non-negative values")
+    total = float(power.sum())
+    if total <= 0.0:
+        return 0.0
+    return float((conjugate_orbit_coverage(mask_array) * power).sum() / total)
+
+
 def prior_observable_energy_fraction(
     mask: np.ndarray, mean_power: np.ndarray
 ) -> float:
