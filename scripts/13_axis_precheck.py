@@ -195,6 +195,49 @@ def main() -> None:
         ("psf_max_sidelobe", "wavelet_leakage"),
         ("sigma_min", "wavelet_leakage"),
     ]
+    # Beyond rank statistics: does sigma_min still vary once coverage is held
+    # fixed? Bin the full-rank masks by rho and report the within-bin spread.
+    # Large within-bin dispersion means conditioning carries information that
+    # coverage does not; near-zero dispersion means the axis is redundant.
+    full_rank_rows = table[table["n_deficient"] == 0].copy()
+    if len(full_rank_rows) >= 6:
+        n_bins_rho = min(4, len(full_rank_rows) // 3)
+        full_rank_rows["rho_bin"] = pd.qcut(full_rank_rows["rho"], q=n_bins_rho, duplicates="drop")
+        log_sigma = np.log10(full_rank_rows["sigma_min"])
+        dispersion = (
+            full_rank_rows.assign(log10_sigma_min=log_sigma)
+            .groupby("rho_bin", observed=True)
+            .agg(
+                n=("mask", "size"),
+                rho_lo=("rho", "min"),
+                rho_hi=("rho", "max"),
+                sigma_min_lo=("sigma_min", "min"),
+                sigma_min_hi=("sigma_min", "max"),
+                log10_spread=("log10_sigma_min", lambda s: float(s.max() - s.min())),
+                log10_std=("log10_sigma_min", "std"),
+            )
+            .reset_index(drop=True)
+        )
+        dispersion.to_csv(run / "metrics" / "axis_precheck_dispersion.csv", index=False)
+        # Variance split of log10 sigma_min: how much is left at fixed coverage?
+        grouped = full_rank_rows.assign(v=log_sigma).groupby("rho_bin", observed=True)["v"]
+        within = float((grouped.transform("mean") - log_sigma).pow(2).mean())
+        total = float(log_sigma.var(ddof=0))
+        print("\nsigma_min dispersion within fixed-rho bins (full-rank masks):")
+        print(dispersion.round(4).to_string(index=False))
+        print(f"within-bin share of log10(sigma_min) variance: {within / max(total, 1e-30):.2f}"
+              " (near 0 = redundant with coverage; near 1 = independent information)")
+
+        viz.scatter_with_labels(
+            full_rank_rows["rho"].tolist(),
+            full_rank_rows["sigma_min"].tolist(),
+            full_rank_rows["mask"].tolist(),
+            run / "plots" / "rho_vs_sigma_min.png",
+            xlabel="rho (observed training-energy fraction)",
+            ylabel="sigma_min of the restricted operator",
+            title="coverage vs restricted conditioning (full-rank masks)",
+        )
+
     # Rank-deficient masks have sigma_min = 0 exactly; ranking them against
     # each other is numerical noise, so sigma_min pairs use only full-rank rows.
     full_rank = table[table["n_deficient"] == 0]

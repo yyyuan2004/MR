@@ -447,6 +447,72 @@ def plot_subband_sigma_min(
     plt.close(fig)
 
 
+# Compressed display names for parameterized family members. Prefix mapping
+# plus suffix compression, so "variable_density_d2.5_s0" -> "vd2.5s0" without
+# per-mask entries.
+_SHORT_PREFIXES = [
+    ("variable_density_lines", "vdl"),
+    ("variable_density", "vd"),
+    ("uniform_random", "uni"),
+    ("multilevel", "ml"),
+    ("psf_penalized", "psf"),
+    ("subspace_aopt", "sub"),
+    ("aopt_greedy", "aopt"),
+    ("equispaced_lines", "equi"),
+    ("line_subspace_leakage", "l-leak"),
+    ("line_aopt", "l-aopt"),
+    ("spectrum_energy_greedy", "spec-e"),
+    ("recon_in_loop_greedy", "ril"),
+    ("data_driven_greedy", "dd"),
+    ("loupe_learned", "loupe"),
+]
+
+# Fixed family order (never cycled): color and marker follow the family.
+_FAMILY_ORDER = ["uniform", "vd", "multilevel", "lines", "psf", "subspace", "other"]
+_FAMILY_MARKERS = {"uniform": "o", "vd": "^", "multilevel": "D", "lines": "s",
+                   "psf": "v", "subspace": "X", "other": "P"}
+
+
+def short_name(name: str) -> str:
+    """Compress a mask name for on-plot labels (vd2.5s0, psf-b4, mlL4d1.5)."""
+    import re
+
+    for prefix, code in _SHORT_PREFIXES:
+        if name == prefix:
+            return code
+        if name.startswith(prefix + "_"):
+            parts = name[len(prefix) + 1 :].split("_")
+            # A leading decay tag is redundant once the family code names it
+            # (vd2.5s0); elsewhere the letter must stay or numbers merge
+            # ambiguously (ml-L4d1.5, not ml-L41.5).
+            if parts[0][:1] == "d" and re.fullmatch(r"d\d+(?:\.\d+)?", parts[0]):
+                parts[0] = parts[0][1:]
+            compressed = "".join(parts)
+            separator = "" if compressed[:1].isdigit() else "-"
+            return f"{code}{separator}{compressed}"
+    return name
+
+
+def design_family(name: str) -> str:
+    """Design family of a mask name, for color/marker assignment."""
+    if name.startswith("uniform_random"):
+        return "uniform"
+    if name.startswith("variable_density_lines"):
+        return "lines"
+    if name.startswith("variable_density"):
+        return "vd"
+    if name.startswith("multilevel"):
+        return "multilevel"
+    if name.startswith(("equispaced", "line_", "spectrum_energy", "loupe")):
+        return "lines"
+    # aopt_greedy is the beta = 0 member of the PSF-penalized family.
+    if name.startswith(("psf_penalized", "aopt_greedy")):
+        return "psf"
+    if name.startswith("subspace_aopt"):
+        return "subspace"
+    return "other"
+
+
 def scatter_with_labels(
     x: Sequence[float],
     y: Sequence[float],
@@ -455,17 +521,50 @@ def scatter_with_labels(
     xlabel: str,
     ylabel: str,
     title: str | None = None,
+    max_direct_labels: int = 6,
+    always_label: Sequence[str] = (),
 ) -> None:
+    """Family-colored scatter with selective direct labels.
+
+    Color and marker follow the design family (fixed order, with a legend);
+    direct labels use compressed names and are attached only to the extreme
+    points — the bottom/top ``max_direct_labels // 2`` by y — plus any names
+    in ``always_label``. Labeling all points is unreadable past ~10 masks.
+    """
     path.parent.mkdir(parents=True, exist_ok=True)
-    fig, ax = plt.subplots(figsize=(6, 5))
-    ax.scatter(x, y, s=40)
-    for xi, yi, label in zip(x, y, labels):
-        ax.annotate(label, (xi, yi), textcoords="offset points", xytext=(6, 4), fontsize=8)
+    x = np.asarray(x, dtype=np.float64)
+    y = np.asarray(y, dtype=np.float64)
+    families = [design_family(label) for label in labels]
+    colors = plt.get_cmap("tab10")
+
+    fig, ax = plt.subplots(figsize=(6.8, 5.2))
+    for family in _FAMILY_ORDER:
+        idx = [i for i, f in enumerate(families) if f == family]
+        if not idx:
+            continue
+        ax.scatter(
+            x[idx], y[idx], s=46,
+            color=colors(_FAMILY_ORDER.index(family)),
+            marker=_FAMILY_MARKERS[family],
+            edgecolors="white", linewidths=0.6, label=family, alpha=0.9,
+        )
+
+    half = max(1, max_direct_labels // 2)
+    order = np.argsort(y)
+    to_label = set(order[:half]) | set(order[-half:])
+    to_label |= {i for i, label in enumerate(labels) if label in set(always_label)}
+    for i in to_label:
+        ax.annotate(
+            short_name(labels[i]), (x[i], y[i]),
+            textcoords="offset points", xytext=(6, 4), fontsize=7.5,
+        )
+
     ax.set_xlabel(xlabel)
     ax.set_ylabel(ylabel)
     if title:
         ax.set_title(title)
     ax.grid(True, alpha=0.3)
+    ax.legend(fontsize=7.5, title="family", title_fontsize=7.5)
     fig.tight_layout()
     fig.savefig(path, dpi=150, bbox_inches="tight")
     plt.close(fig)

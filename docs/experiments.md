@@ -244,3 +244,18 @@ level-2 horizontal 0.77 for `line_subspace_leakage` — which is exactly the
 statement "column sampling conditions one orientation and collapses the
 other" as a measured quantity. Point masks degrade smoothly from coarse to
 fine scales instead. Level 1 denotes the coarsest detail level.
+
+### Dispersion of sigma_min at fixed coverage
+
+Rank statistics alone cannot say whether conditioning is informative *given*
+coverage, so script 13 also bins the full-rank masks into fixed-rho quantile
+bins and reports the within-bin spread of sigma_min
+(`metrics/axis_precheck_dispersion.csv`, plus a family-colored
+`plots/rho_vs_sigma_min.png`). On the default family the answer is
+regime-dependent: at low-to-mid coverage the within-bin spread is 1.8-2.3
+decades of sigma_min at essentially fixed rho (conditioning carries real
+information beyond coverage there), while in the highest-coverage bins the
+spread collapses to 0.2-0.3 decades (coverage determines conditioning for
+energy-dense masks). Overall, 29% of the log10 sigma_min variance lies within
+bins. The global rank correlation is also support-size dependent (+0.77 at
+|S| = 384 vs +0.97 at |S| = 256), so any redundancy claim must state |S|.
