@@ -79,7 +79,14 @@ recon:
   ridge_lambda: 0.05
   wavelet_ista:
     threshold: 0.02
-    n_iters: 15
+    # Monotone FISTA. At 15 plain-ISTA iterations the objective sat about
+    # 4 orders of magnitude above the minimizer, which mixes solver dynamics
+    # into any comparison between masks. 60 momentum iterations reach a
+    # smaller gap than 150 plain ones; measured on the default family the
+    # mask ranking was unchanged, so this buys correctness, not a new result.
+    momentum: true
+    n_iters: 60
+    tol: 1.0e-6
     wavelet: db4
     levels: 3
     # With noisy measurements, exact replacement would re-inject the observed

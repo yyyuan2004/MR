@@ -729,6 +729,8 @@ def reconstruct_all(
                 wavelet=str(ista_cfg.get("wavelet", "db4")),
                 levels=int(ista_cfg.get("levels", 3)),
                 final_dc=bool(ista_cfg.get("final_dc", True)),
+                momentum=bool(ista_cfg.get("momentum", True)),
+                tol=float(ista_cfg.get("tol", 0.0)),
             )
 
         fixed = float(ista_cfg["threshold"])
@@ -1012,6 +1014,8 @@ def tune_ista_threshold(
             wavelet=str(ista_cfg.get("wavelet", "db4")),
             levels=int(ista_cfg.get("levels", 3)),
             final_dc=bool(ista_cfg.get("final_dc", True)),
+            momentum=bool(ista_cfg.get("momentum", True)),
+            tol=float(ista_cfg.get("tol", 0.0)),
         )
         psnr = float(
             np.mean([

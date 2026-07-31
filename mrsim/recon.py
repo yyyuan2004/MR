@@ -358,6 +358,21 @@ def _wavelet_l1(x: torch.Tensor, wavelet: str, levels: int) -> float:
     return total
 
 
+def _ista_objective(
+    x: torch.Tensor,
+    y: torch.Tensor,
+    mask_t: torch.Tensor,
+    threshold: float,
+    wavelet: str,
+    levels: int,
+) -> float:
+    """Value of 0.5 * ||M F x - y||^2 + threshold * ||W x||_1."""
+    residual = mask_t * fft2c(x) - y
+    return 0.5 * float((residual.abs() ** 2).sum()) + threshold * _wavelet_l1(
+        x, wavelet, levels
+    )
+
+
 def wavelet_ista(
     y: torch.Tensor,
     mask: np.ndarray | torch.Tensor,
@@ -368,8 +383,10 @@ def wavelet_ista(
     levels: int = 3,
     final_dc: bool = True,
     return_history: bool = False,
+    momentum: bool = True,
+    tol: float = 0.0,
 ) -> torch.Tensor | IstaResult:
-    """Solve min_x 0.5 * ||M F x - y||^2 + threshold * ||W x||_1 by ISTA.
+    """Solve min_x 0.5 * ||M F x - y||^2 + threshold * ||W x||_1.
 
     Step size 1.0 is valid because the forward operator satisfies A^H A = P
     (an orthogonal projector), so the data-fidelity gradient is 1-Lipschitz.
@@ -377,29 +394,81 @@ def wavelet_ista(
     iterates leave the observed subspace and impute null-space content, unlike
     zero filling or a zero-mean diagonal reconstruction.
 
+    With ``momentum`` (the default) the solver is monotone FISTA: the proximal
+    step is taken at an extrapolated point for the O(1/k^2) rate, and the
+    iterate is only accepted when it does not increase the objective. Plain
+    ISTA converges at O(1/k), which at the iteration counts used here leaves
+    the solver far from the minimizer — and an unconverged solver confounds any
+    comparison *between masks*, because the measured difference then mixes mask
+    quality with solver dynamics. Pass ``momentum=False`` for the historical
+    plain-ISTA iteration.
+
+    ``tol`` optionally stops early once the relative objective decrease falls
+    below it; the default 0.0 always runs the full ``n_iters``.
+
     If final_dc, one data-consistency step replaces measured frequency
     coefficients with the measurements. Deterministic: no randomness anywhere.
     With return_history, returns IstaResult(image, objective_history); the
-    history holds the objective after each proximal step and is non-increasing
-    up to floating-point round-off.
+    history holds the accepted objective after each proximal step and is
+    non-increasing up to floating-point round-off in both modes.
     """
     if threshold < 0.0:
         raise ValueError("threshold must be non-negative")
+    if tol < 0.0:
+        raise ValueError("tol must be non-negative")
     y = y.to(torch.complex64)
     mask_t = as_mask_tensor(mask, like=y)
     adjoint = ifft2c(y)  # A^H y; y is already masked
     x = adjoint.clone()
+    extrapolated = x.clone()
+    t = 1.0
     history: list[float] = []
+    # The monotone guard and the stopping rule both need the objective; plain
+    # ISTA without history or tolerance keeps the cheaper transform-only loop.
+    track_objective = return_history or momentum or tol > 0.0
+    objective = (
+        _ista_objective(x, y, mask_t, threshold, wavelet, levels)
+        if track_objective
+        else math.inf
+    )
+
     for _ in range(n_iters):
-        # Gradient of the data term is A^H (A x - y) = P x - A^H y.
-        x_grad = x - (projector(x, mask_t) - adjoint)
-        x = _wavelet_soft_threshold(x_grad, threshold, wavelet, levels)
-        if return_history:
-            residual = mask_t * fft2c(x) - y
-            objective = 0.5 * float((residual.abs() ** 2).sum()) + threshold * _wavelet_l1(
-                x, wavelet, levels
+        # Gradient of the data term is A^H (A z - y) = P z - A^H y.
+        gradient_step = extrapolated - (projector(extrapolated, mask_t) - adjoint)
+        candidate = _wavelet_soft_threshold(gradient_step, threshold, wavelet, levels)
+
+        if not track_objective:
+            x = candidate
+            extrapolated = candidate
+            continue
+
+        candidate_objective = _ista_objective(
+            candidate, y, mask_t, threshold, wavelet, levels
+        )
+        previous, previous_objective = x, objective
+        if candidate_objective <= previous_objective:
+            x, objective = candidate, candidate_objective
+        history.append(objective)
+
+        if momentum:
+            # MFISTA: extrapolate from the accepted iterate through the
+            # candidate, which keeps the accelerated rate while the guard above
+            # keeps the objective sequence monotone.
+            t_next = 0.5 * (1.0 + math.sqrt(1.0 + 4.0 * t * t))
+            extrapolated = (
+                x
+                + (t / t_next) * (candidate - x)
+                + ((t - 1.0) / t_next) * (x - previous)
             )
-            history.append(objective)
+            t = t_next
+        else:
+            extrapolated = x
+
+        if tol > 0.0 and previous_objective - objective <= tol * max(
+            abs(objective), 1e-12
+        ):
+            break
+
     if final_dc:
         x = x + ifft2c(y - mask_t * fft2c(x))
     if return_history:
