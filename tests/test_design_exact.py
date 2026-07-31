@@ -166,3 +166,71 @@ def test_design_rejects_bad_inputs():
         design.diagonal_bayes(np.ones((4, 4)), power, 0.0)
     with pytest.raises(ValueError):
         design.diagonal_bayes(np.ones((2, 2)), power, NOISE_VAR)
+
+
+def test_relaxation_meets_the_budget_and_bounds_every_mask():
+    rng = np.random.default_rng(5)
+    power = rng.random((8, 8)) + 0.01
+    budget, noise_var = 20, 0.05
+    weights, bound = design.diagonal_relaxed_optimum(power, budget, noise_var)
+    assert weights.sum() == pytest.approx(budget, abs=1e-6)
+    assert np.all(weights >= -1e-12) and np.all(weights <= 1.0 + 1e-12)
+    for _ in range(25):
+        flat = np.zeros(64)
+        flat[rng.choice(64, budget, replace=False)] = 1.0
+        achieved = design.diagonal_logdet(flat.reshape((8, 8)), power, noise_var)
+        assert achieved <= bound + 1e-9
+
+
+def test_top_k_is_certified_optimal_against_the_exact_binary_optimum():
+    rng = np.random.default_rng(6)
+    power = rng.random((8, 8)) + 0.01
+    budget, noise_var = 20, 0.05
+    gap = design.optimality_gap(greedy_a_optimal(power, budget), power, noise_var)
+    assert gap["optimality_gap_nats"] == pytest.approx(0.0, abs=1e-9)
+
+
+def test_the_convex_relaxation_is_loose_and_must_not_be_read_as_suboptimality():
+    """Its distance from the binary optimum is an integrality gap.
+
+    Reporting it as a mask's optimality gap would say top-k is tens of nats
+    suboptimal when top-k is provably the exact binary optimum.
+    """
+    rng = np.random.default_rng(6)
+    power = rng.random((8, 8)) + 0.01
+    budget, noise_var = 20, 0.05
+    gap = design.optimality_gap(greedy_a_optimal(power, budget), power, noise_var)
+    assert gap["relaxed_upper_bound"] > gap["binary_optimum"] + 1.0
+    assert gap["integrality_gap_nats"] > 1.0
+
+
+def test_binary_optimum_matches_exhaustive_search():
+    rng = np.random.default_rng(7)
+    power = rng.random((3, 4)) + 0.01
+    budget, noise_var = 5, 0.05
+    best = max(
+        design.diagonal_logdet(
+            np.isin(np.arange(12), indices).astype(float).reshape((3, 4)),
+            power,
+            noise_var,
+        )
+        for indices in itertools.combinations(range(12), budget)
+    )
+    assert design.diagonal_binary_optimum(power, budget, noise_var) == pytest.approx(best)
+
+
+def test_a_poor_mask_shows_a_positive_gap():
+    power = np.exp(-np.linspace(0.0, 6.0, 64)).reshape((8, 8))
+    budget, noise_var = 12, 0.05
+    worst = np.zeros((8, 8))
+    worst.ravel()[-budget:] = 1.0  # spend the budget on the weakest coefficients
+    gap = design.optimality_gap(worst, power, noise_var)
+    assert gap["optimality_gap_nats"] > 1.0
+
+
+def test_relaxation_rejects_an_infeasible_budget():
+    power = np.ones((4, 4))
+    with pytest.raises(ValueError):
+        design.diagonal_relaxed_optimum(power, 17, 0.05)
+    with pytest.raises(ValueError):
+        design.diagonal_relaxed_optimum(power, 0, 0.05)

@@ -138,6 +138,146 @@ def diagonal_bayes(
     }
 
 
+def diagonal_logdet(
+    weights: np.ndarray, power_spectrum: np.ndarray, noise_var: float
+) -> float:
+    """D-optimal objective ``logdet(diag(w)/sigma^2 + Lambda^-1)`` up to a constant.
+
+    ``weights`` may be fractional, which is what makes the design problem
+    convex. A binary mask is the special case ``w in {0, 1}``.
+    """
+    w = np.asarray(weights, dtype=np.float64)
+    power = np.asarray(power_spectrum, dtype=np.float64)
+    if w.shape != power.shape:
+        raise ValueError("weights and power_spectrum must have the same shape")
+    if np.any(w < -1e-12) or np.any(w > 1.0 + 1e-12):
+        raise ValueError("weights must lie in [0, 1]")
+    if not np.isfinite(noise_var) or noise_var <= 0.0:
+        raise ValueError("noise_var must be finite and positive")
+    with np.errstate(divide="ignore"):
+        prior_precision = np.where(power > 0.0, 1.0 / np.maximum(power, 1e-300), 0.0)
+    active = power > 0.0
+    return float(np.log(w[active] / noise_var + prior_precision[active]).sum())
+
+
+def diagonal_relaxed_optimum(
+    power_spectrum: np.ndarray,
+    budget: int,
+    noise_var: float,
+    *,
+    tol: float = 1e-12,
+    max_iter: int = 200,
+) -> tuple[np.ndarray, float]:
+    """Exact optimum of the Joshi-Boyd relaxation for a diagonal prior.
+
+    Maximizing ``sum_k log(w_k / sigma^2 + 1/s_k)`` over ``0 <= w <= 1`` with
+    ``sum w = m`` is separable and concave, and the stationarity condition gives
+    ``w_k = clip(t - sigma^2 / s_k, 0, 1)`` for a single scalar ``t`` fixed by
+    the budget -- reverse water-filling. Bisection on ``t`` solves it to machine
+    precision, so no solver dependency is needed.
+
+    Because the relaxation's feasible set contains every binary mask of the same
+    budget, its optimum is a genuine **upper bound** on what any mask can
+    achieve. It is not a tight one: the optimal ``w`` is largely fractional, and
+    for a diagonal prior the bound sits tens of nats above the true binary
+    optimum. That difference is an integrality gap, a property of the
+    relaxation, and reading it as suboptimality of a mask would be wrong -- see
+    :func:`diagonal_binary_optimum`, which is exact here and is what
+    :func:`optimality_gap` reports against.
+
+    The solution does order locations by ``s_k``, so rounding it returns the
+    top-k mask, which is the exact binary optimum. The relaxation therefore
+    recovers the right design while overstating what is achievable.
+    """
+    power = np.asarray(power_spectrum, dtype=np.float64)
+    if not np.isfinite(power).all() or np.any(power < 0.0):
+        raise ValueError("power_spectrum must contain finite, non-negative values")
+    if not np.isfinite(noise_var) or noise_var <= 0.0:
+        raise ValueError("noise_var must be finite and positive")
+    n_available = int((power > 0.0).sum())
+    if not 1 <= budget <= max(n_available, 1):
+        raise ValueError(
+            f"budget={budget} must lie in [1, {n_available}] (locations with "
+            "positive prior power)"
+        )
+
+    offset = np.where(power > 0.0, noise_var / np.maximum(power, 1e-300), np.inf)
+
+    def allocation(t: float) -> np.ndarray:
+        return np.clip(t - offset, 0.0, 1.0)
+
+    low, high = 0.0, float(np.max(offset[np.isfinite(offset)]) + 1.0)
+    for _ in range(max_iter):
+        middle = 0.5 * (low + high)
+        if allocation(middle).sum() < budget:
+            low = middle
+        else:
+            high = middle
+        if high - low < tol:
+            break
+    weights = allocation(0.5 * (low + high))
+    return weights, diagonal_logdet(weights, power, noise_var)
+
+
+def diagonal_binary_optimum(
+    power_spectrum: np.ndarray, budget: int, noise_var: float
+) -> float:
+    """Exact best D-optimal objective over binary masks of a given budget.
+
+    The objective separates as ``const + sum_{k in Omega} log(1 + s_k/sigma^2)``,
+    and the per-location gain is monotone in ``s_k``, so the binary optimum is a
+    top-k rule and is available in closed form -- no relaxation and no rounding
+    needed. This is the same degeneracy :func:`diagonal_bayes` documents for the
+    A-optimal criterion, now for the D-optimal one.
+    """
+    power = np.asarray(power_spectrum, dtype=np.float64)
+    if not np.isfinite(power).all() or np.any(power < 0.0):
+        raise ValueError("power_spectrum must contain finite, non-negative values")
+    if not np.isfinite(noise_var) or noise_var <= 0.0:
+        raise ValueError("noise_var must be finite and positive")
+    if not 1 <= budget <= power.size:
+        raise ValueError(f"budget={budget} must lie in [1, {power.size}]")
+    baseline = diagonal_logdet(np.zeros_like(power), power, noise_var)
+    gains = np.sort(np.log1p(power.ravel() / noise_var))[::-1]
+    return float(baseline + gains[:budget].sum())
+
+
+def optimality_gap(
+    mask: np.ndarray, power_spectrum: np.ndarray, noise_var: float
+) -> dict[str, float]:
+    """How far a mask sits below the best achievable D-optimal objective.
+
+    The reported gap is against :func:`diagonal_binary_optimum`, which is exact
+    for this prior, so a gap of zero genuinely certifies the mask as optimal and
+    a positive gap is exactly what a better design of the same budget would
+    gain. The package could not previously make a statement of this kind at all;
+    every comparison was relative to other heuristics.
+
+    The convex relaxation's value is reported alongside for reference, but it
+    is a loose upper bound here and its distance from the binary optimum is an
+    integrality gap rather than anything about the mask.
+
+    One caveat worth stating where it will be seen: the ``(1 - 1/e)`` greedy
+    guarantee applies to this monotone submodular logdet objective, **not** to
+    the A-optimal trace objective that ``greedy.greedy_a_optimal`` and
+    ``greedy.greedy_subspace_aoptimal`` actually optimize. The trace objective
+    is not submodular in general, so that guarantee must not be transferred to
+    them.
+    """
+    mask_array, power = _validated_inputs(mask, power_spectrum, noise_var)
+    budget = int(mask_array.sum())
+    achieved = diagonal_logdet(mask_array, power, noise_var)
+    best = diagonal_binary_optimum(power, budget, noise_var)
+    _, relaxed = diagonal_relaxed_optimum(power, budget, noise_var)
+    return {
+        "achieved_logdet": achieved,
+        "binary_optimum": best,
+        "relaxed_upper_bound": relaxed,
+        "optimality_gap_nats": float(best - achieved),
+        "integrality_gap_nats": float(relaxed - best),
+    }
+
+
 def subspace_bayes(
     mask: np.ndarray,
     basis: np.ndarray,
