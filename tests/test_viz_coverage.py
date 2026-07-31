@@ -118,3 +118,59 @@ def test_representative_subset_keeps_extremes(train_power):
 
 def test_representative_subset_is_identity_when_small(mask_dict, train_power):
     assert representative_subset(mask_dict, train_power, n=8) == mask_dict
+
+
+def test_short_names_compress_family_members():
+    from mrsim.viz import short_name
+
+    assert short_name("variable_density_d2.5_s0") == "vd2.5s0"
+    assert short_name("psf_penalized_b4") == "psf-b4"
+    assert short_name("multilevel_L4_d1.5") == "ml-L4d1.5"
+    assert short_name("variable_density_lines_d1") == "vdl1"
+    assert short_name("uniform_random_s2") == "uni-s2"
+    assert short_name("aopt_greedy") == "aopt"
+    assert short_name("unknown_mask") == "unknown_mask"
+    # Distinct names must stay distinct after compression.
+    names = ["variable_density_d2.5_s0", "variable_density_d2.5_s1",
+             "psf_penalized_b1", "psf_penalized_b4", "multilevel_L3_d2"]
+    assert len({short_name(n) for n in names}) == len(names)
+
+
+def test_design_family_covers_the_whole_default_family():
+    from mrsim.viz import design_family
+
+    expected = {
+        "uniform_random_s0": "uniform",
+        "variable_density_d3.5_s1": "vd",
+        "variable_density_lines_d2": "lines",
+        "multilevel_L4_d1.5": "multilevel",
+        "equispaced_lines": "lines",
+        "line_aopt": "lines",
+        "spectrum_energy_greedy": "lines",
+        "loupe_learned": "lines",
+        "aopt_greedy": "psf",
+        "psf_penalized_b2": "psf",
+        "subspace_aopt_b0": "subspace",
+        "something_else": "other",
+    }
+    for name, family in expected.items():
+        assert design_family(name) == family, name
+
+
+def test_scatter_with_labels_handles_full_family(tmp_path):
+    from mrsim.viz import scatter_with_labels
+
+    rng = np.random.default_rng(0)
+    names = (
+        [f"uniform_random_s{i}" for i in range(5)]
+        + [f"variable_density_d{d}_s0" for d in (1.5, 2.5, 3.5, 5.0)]
+        + [f"multilevel_L{L}_d1.5" for L in (3, 4, 5)]
+        + [f"psf_penalized_b{b}" for b in (0.5, 1, 2, 4)]
+        + ["equispaced_lines", "line_aopt", "subspace_aopt_b0", "aopt_greedy"]
+    )
+    out = tmp_path / "scatter.png"
+    scatter_with_labels(
+        rng.random(len(names)), rng.random(len(names)), names, out,
+        xlabel="x", ylabel="y", always_label=["aopt_greedy"],
+    )
+    assert out.exists()
