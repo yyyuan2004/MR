@@ -341,6 +341,32 @@ def subband_spectral_mass(
     return mass
 
 
+def local_coherence_map(
+    shape: tuple[int, int], wavelet: str = "db4", levels: int = 3
+) -> np.ndarray:
+    """Squared local coherence ``mu(k)^2`` between Fourier atoms and wavelets.
+
+    Global coherence is the wrong instrument for a Fourier-wavelet pair. It is
+    a single maximum, attained by the coarsest approximation band, and the
+    classical sample-count bound ``m >~ mu^2 k log N`` built from it is vacuous
+    here: at 64x64 with db4 the global ``mu`` is 8, so the bound demands more
+    measurements than the ambient dimension. What carries information is how
+    coherence *varies* with frequency, which is exactly what makes multilevel
+    sampling the right family (Adcock, Hansen, Poon and Roman).
+
+    Atoms within one subband are translates and share a magnitude spectrum, so
+    ``mass_b(k) = |<f_k, psi_b>|^2`` for a unit-norm atom and
+
+        mu(k)^2 = N * max_b mass_b(k).
+
+    Returned unnormalized; :func:`mrsim.masks.coherence_weighted_mask` turns it
+    into a sampling density.
+    """
+    mass = subband_spectral_mass(shape, wavelet=wavelet, levels=levels)
+    stacked = np.stack(list(mass.values()))
+    return float(shape[0] * shape[1]) * stacked.max(axis=0)
+
+
 def subband_energies(
     images: np.ndarray, wavelet: str = "db4", levels: int = 3
 ) -> dict[str, float]:

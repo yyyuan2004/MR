@@ -39,6 +39,7 @@ mask:
     - uniform_random
     - variable_density
     - multilevel_random
+    - multilevel_local_coherence
     - equispaced_lines
     - variable_density_lines
 

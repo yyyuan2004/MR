@@ -245,6 +245,58 @@ def multilevel_random_mask(
     return mask_from_indices(shape, np.concatenate([center, *chosen]))
 
 
+def coherence_weighted_mask(
+    shape: tuple[int, int],
+    n_samples: int,
+    rng: np.random.Generator,
+    weights: np.ndarray,
+    n_center: int = 0,
+) -> np.ndarray:
+    """Random selection with density proportional to a supplied weight map.
+
+    Intended for a *derived* sampling density rather than a tuned one. The
+    other variable-density helpers here take a decay exponent chosen by hand;
+    passing :func:`mrsim.artifacts.local_coherence_map` instead gives the
+    density that compressed-sensing theory for Fourier-wavelet pairs actually
+    points at, with no free parameter to fit.
+
+    ``weights`` must be finite and non-negative and is normalized internally;
+    locations of zero weight are never selected unless the budget forces it.
+    """
+    validate_budget(shape, n_samples, n_center)
+    weight_array = np.asarray(weights, dtype=np.float64)
+    if weight_array.shape != tuple(shape):
+        raise ValueError(
+            f"weights shape {weight_array.shape} does not match mask shape {tuple(shape)}"
+        )
+    if not np.isfinite(weight_array).all() or np.any(weight_array < 0.0):
+        raise ValueError("weights must be finite and non-negative")
+
+    center = center_indices(shape, n_center)
+    flat = weight_array.ravel().copy()
+    flat[center] = 0.0
+    n_draw = n_samples - center.size
+    if n_draw <= 0:
+        return mask_from_indices(shape, center)
+
+    positive = np.flatnonzero(flat > 0.0)
+    if positive.size < n_draw:
+        # Not enough support in the weights: take all of it, then fill the
+        # remainder with the least-bad zero-weight locations by radius so the
+        # budget is still met exactly.
+        remaining = np.setdiff1d(
+            np.arange(flat.size, dtype=np.int64),
+            np.concatenate([center, positive]),
+        )
+        order = remaining[np.argsort(radius_map(shape).ravel()[remaining], kind="stable")]
+        chosen = np.concatenate([positive, order[: n_draw - positive.size]])
+        return mask_from_indices(shape, np.concatenate([center, chosen]))
+
+    probability = flat / flat.sum()
+    chosen = rng.choice(flat.size, size=n_draw, replace=False, p=probability)
+    return mask_from_indices(shape, np.concatenate([center, chosen]))
+
+
 def jaccard(mask_a: np.ndarray, mask_b: np.ndarray) -> float:
     """Jaccard overlap |A and B| / |A or B| between two binary masks."""
     a = mask_a > 0.5

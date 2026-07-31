@@ -349,6 +349,17 @@ def build_masks(
             decay=float(ml_cfg.get("decay", 1.5)),
             n_center=n_center,
         ),
+        # Sampling density derived from Fourier-wavelet local coherence rather
+        # than from a hand-chosen decay exponent; no free parameter to fit.
+        "multilevel_local_coherence": lambda: masks.coherence_weighted_mask(
+            shape, n_samples,
+            _named_rng(seed, "mask", "multilevel_local_coherence"),
+            artifacts.local_coherence_map(shape, wavelet=wavelet, levels=levels),
+            n_center=n_center,
+        ),
+        "aopt_greedy_hermitian": lambda: greedy.greedy_a_optimal_hermitian(
+            _prior(), n_samples, noise_var=noise_var, n_center=n_center
+        ),
         "aopt_greedy": lambda: greedy.greedy_a_optimal(
             _prior(), n_samples, noise_var=noise_var, n_center=n_center
         ),
